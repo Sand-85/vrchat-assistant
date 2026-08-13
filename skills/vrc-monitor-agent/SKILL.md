@@ -157,6 +157,18 @@ curl -s http://127.0.0.1:8799/mcp -X POST -H "Content-Type: application/json" \
 
 建议用昵称代替原始显示名以提高可读性。companion 数据可展示为：`| 排名 | 好友 | 共处时间 | 同屏实例 | 最近一次 |`，并附一行小结总结社交模式。
 
+### 地图/世界展示格式（用户固化要求）
+
+展示地图列表时按此格式：`| 序号 | 封面 | 地图名称 | 热度 | 备注 | 地图链接 |`
+
+- **序号**：列表最前方，从 1 递增
+- **地图链接**：位于**备注后**，格式 `https://vrchat.com/home/world/{worldId}`（由 `worldId` 拼接，如 `wrld_xxx` → `https://vrchat.com/home/world/wrld_xxx`）
+- 封面/热度/备注等其余字段按上下文数据填充（无数据时省略对应列，地图链接列保留）
+
+示例：`| 1 | 超軽量ログインワールド | 🔴507万 | 登录用轻量图 | https://vrchat.com/home/world/wrld_6a246432-e224-454f-8962-615182276e26 |`
+
+> QQ Bot 场景：无封面列（同 Booth skill 规则），其余格式不变。
+
 ## 常见陷阱
 
 ### 时间戳
