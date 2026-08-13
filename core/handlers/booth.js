@@ -112,7 +112,9 @@ function normalizeItem(d) {
   };
 }
 
-/** 串行抓取多个商品详情（Booth 无并发限制要求，但保持轻量），单卡失败不影响整体 */
+const ITEM_FETCH_INTERVAL_MS = 400; // 串行详情查询间隔（限速，对 Booth 保持礼貌）
+
+/** 串行抓取多个商品详情（限速 400ms/个，单卡失败不影响整体） */
 async function enrichItems(cards, limit) {
   const out = [];
   for (const c of cards.slice(0, limit)) {
@@ -122,6 +124,7 @@ async function enrichItems(cards, limit) {
     } catch (e) {
       log(`[booth] item ${c.id} fetch failed: ${e.message}`);
     }
+    await new Promise(r => setTimeout(r, ITEM_FETCH_INTERVAL_MS));
   }
   return out;
 }
