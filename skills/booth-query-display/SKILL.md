@@ -18,6 +18,34 @@ metadata:
 - 「展示 Booth 商品」/「附封面展示」
 - 用户要求查 VRChat 相关素材（avatar/衣装/3D 模型）在 Booth 的售价与热度
 
+## 浏览器访问流程（重要修正）
+
+**优先使用电脑的默认浏览器**，而非临时启动的调试实例：
+
+1. **检测默认浏览器**（Windows）：
+   ```bash
+   reg query "HKCU\Software\Microsoft\Windows\Shell\Associations\UrlAssociations\http\UserChoice" | grep ProgId
+   # MSEdgeHTM → Edge；ChromeHTML → Chrome；FirefoxURL → Firefox
+   ```
+2. **用默认浏览器打开目标页**（如 Booth 登录页）：
+   ```bash
+   # 默认浏览器直接打开 URL（Windows 用 start / cmd /c start）
+   cmd //c start "" "https://booth.pm/users/sign_in"
+   # 或显式指定浏览器路径（Edge 示例）
+   "/c/Program Files (x86)/Microsoft/Edge/Application/msedge.exe" "https://booth.pm/users/sign_in"
+   ```
+3. **需自动化接管时**：给默认浏览器附加 CDP 调试端口启动（**必须带独立 `--user-data-dir`**，避免与用户日常浏览会话冲突）：
+   ```bash
+   EDGE="/c/Program Files (x86)/Microsoft/Edge/Application/msedge.exe"
+   "$EDGE" --remote-debugging-port=9222 --user-data-dir="$LOCALAPPDATA/Temp/edge-debug-profile" --no-first-run "URL"
+   # Chrome 同理；CDP 端点 http://127.0.0.1:9222/json
+   ```
+4. **手动登录页场景**（reCAPTCHA 等无法自动化的）：
+   - 优先用默认浏览器打开页面让用户操作，或
+   - 用上述 CDP 实例打开——**登录窗口会出现在该实例中**，提示用户在对应窗口完成登录（可能与你日常浏览窗口并存，注意区分）
+
+> 经验：本机默认浏览器为 Edge（MSEdgeHTM）。`browser_exec` 工具默认连 Chrome，若 Chrome 未授权远程调试，改走默认浏览器 + CDP 更顺。
+
 ## 数据源与限制（必读）
 
 - **搜索页**：`https://booth.pm/ja/search/{关键词}?page=N`（HTML，每页约 60 个商品，关键词用 `encodeURIComponent`）
