@@ -63,6 +63,8 @@ import {
 import {
   handleSearchBoothItems,
   handleGetBoothItem,
+  handleGetBoothHistory,
+  handleGetBoothSearches,
 } from './handlers/booth.js';
 
 
@@ -326,6 +328,12 @@ export async function handleRpc(rpc, session, res) {
             break;
           case 'get_booth_item':
             result = await handleGetBoothItem(args);
+            break;
+          case 'get_booth_history':
+            result = await handleGetBoothHistory(args);
+            break;
+          case 'get_booth_searches':
+            result = await handleGetBoothSearches(args);
             break;
           case 'recommend_planet_worlds':
             result = await handleRecommendPlanetWorlds(args);

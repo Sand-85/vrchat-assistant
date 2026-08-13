@@ -152,3 +152,31 @@ CREATE TABLE IF NOT EXISTS join_choices (
   world_tags TEXT DEFAULT ''        -- 被选世界的 author_tag_* 标签 JSON 数组（类型偏好学习用）
 );
 CREATE INDEX IF NOT EXISTS idx_join_choices_created ON join_choices(created_at);
+
+-- BOOTH 商品快照缓存（search_booth_items / get_booth_item 命中时 upsert，Issue #28）
+-- 目的：搜过的商品事后可查、收藏数趋势跟踪、重复搜索走缓存避免触发 booth.pm 限流
+CREATE TABLE IF NOT EXISTS booth_items (
+  id TEXT PRIMARY KEY,               -- BOOTH item id（字符串，兼容数字）
+  name TEXT NOT NULL DEFAULT '',
+  price TEXT DEFAULT '',             -- 原价格字符串（¥ 5,500 / ¥ 500~ 多档变体）
+  wishlist_count INTEGER DEFAULT 0,  -- 收藏数（BOOTH 唯一公开热度信号）
+  shop_name TEXT DEFAULT '',
+  description TEXT DEFAULT '',
+  tags TEXT DEFAULT '',              -- JSON 数组
+  image_url TEXT DEFAULT '',         -- 首图 original URL
+  url TEXT DEFAULT '',
+  published_at TEXT DEFAULT '',
+  is_sold_out INTEGER DEFAULT 0,
+  updated_at TEXT DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_booth_items_wishlist ON booth_items(wishlist_count);
+
+-- BOOTH 搜索历史（记录搜索词与结果，支持"查历史搜索"）
+CREATE TABLE IF NOT EXISTS booth_search_history (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  query TEXT NOT NULL,
+  result_ids TEXT DEFAULT '',        -- JSON 数组（商品 id 列表）
+  result_count INTEGER DEFAULT 0,
+  created_at TEXT DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_booth_search_created ON booth_search_history(created_at);

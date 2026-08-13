@@ -114,13 +114,24 @@ function normalizeItem(d) {
 
 const ITEM_FETCH_INTERVAL_MS = 400; // 串行详情查询间隔（限速，对 Booth 保持礼貌）
 
-/** 串行抓取多个商品详情（限速 400ms/个，单卡失败不影响整体） */
+/** 落库旁路：失败不影响实时返回（Issue #28） */
+function persistItem(item) {
+  try { ctx.storage.upsertBoothItem(item); } catch (e) { log(`[booth] persist item ${item.id} failed: ${e.message}`); }
+}
+
+function persistSearch(query, items) {
+  try { ctx.storage.recordBoothSearch(query, items.map(i => i.id)); } catch (e) { log(`[booth] persist search failed: ${e.message}`); }
+}
+
+/** 串行抓取多个商品详情（限速 400ms/个，单卡失败不影响整体），命中即落库 */
 async function enrichItems(cards, limit) {
   const out = [];
   for (const c of cards.slice(0, limit)) {
     try {
       const d = await fetchJson(`${BASE}/ja/items/${c.id}.json`);
-      out.push(normalizeItem(d));
+      const item = normalizeItem(d);
+      out.push(item);
+      persistItem(item);
     } catch (e) {
       log(`[booth] item ${c.id} fetch failed: ${e.message}`);
     }
@@ -129,7 +140,7 @@ async function enrichItems(cards, limit) {
   return out;
 }
 
-/** search_booth_items — 关键词搜索 Booth 商品（返回 TopN 详情，含收藏数/价格/卖家） */
+/** search_booth_items — 关键词搜索 Booth 商品（返回 TopN 详情，含收藏数/价格/卖家），结果落库 */
 export async function handleSearchBoothItems({ query, limit = 5, detail = true }) {
   if (!query || !String(query).trim()) throw new Error('query is required');
   const n = Math.max(1, Math.min(10, Number(limit) || 5));
@@ -139,24 +150,43 @@ export async function handleSearchBoothItems({ query, limit = 5, detail = true }
   if (cards.length === 0) return { query, results: [], total: 0 };
 
   if (detail === false) {
-    // 只返回列表页信息（不逐个抓 .json，快）
-    return {
-      query,
-      total: cards.length,
-      results: cards.slice(0, n).map(c => ({ ...c, detail: false })),
-    };
+    // 只返回列表页信息（不逐个抓 .json，快），仍记录搜索历史
+    const listResults = cards.slice(0, n).map(c => ({ ...c, detail: false }));
+    persistSearch(query, listResults);
+    return { query, total: cards.length, results: listResults };
   }
 
   const results = await enrichItems(cards, n);
+  persistSearch(query, results);
   return { query, total: cards.length, results };
 }
 
-/** get_booth_item — 单品详情（收藏数/价格/卖家/变体/描述） */
-export async function handleGetBoothItem({ itemId }) {
+/** get_booth_item — 单品详情（收藏数/价格/卖家/变体/描述），命中即落库 */
+export async function handleGetBoothItem({ itemId, forceRefresh = false }) {
   if (!itemId) throw new Error('itemId is required');
   const id = String(itemId).replace(/\D/g, '');
   if (!id) throw new Error('invalid itemId');
 
+  // 缓存命中直接返回（forceRefresh 或缓存缺失才抓实时）
+  if (!forceRefresh) {
+    const cached = ctx.storage.getBoothItemCache(id);
+    if (cached) return { ...cached, cached: true };
+  }
+
   const d = await fetchJson(`${BASE}/ja/items/${id}.json`);
-  return normalizeItem(d);
+  const item = normalizeItem(d);
+  persistItem(item);
+  return { ...item, cached: false };
+}
+
+/** get_booth_history — 已查询过的商品快照（按收藏数/更新时间排序，趋势跟踪） */
+export async function handleGetBoothHistory({ sortBy = 'wishlist', limit = 20, minWishlist = 0 } = {}) {
+  const rows = ctx.storage.listBoothItems({ sortBy, limit, minWishlist });
+  return { total: rows.length, items: rows };
+}
+
+/** get_booth_searches — 最近搜索历史 */
+export async function handleGetBoothSearches({ limit = 10 } = {}) {
+  const rows = ctx.storage.getBoothSearches({ limit });
+  return { total: rows.length, searches: rows };
 }

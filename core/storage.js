@@ -400,6 +400,82 @@ export class Storage {
     return { worldId: r.world_id, note: r.note };
   }
 
+  /** BOOTH 商品快照 upsert（Issue #28：落库旁路缓存，失败不影响实时返回——调用方 try-catch） */
+  upsertBoothItem(item) {
+    this._run(
+      `INSERT INTO booth_items (id, name, price, wishlist_count, shop_name, description, tags, image_url, url, published_at, is_sold_out, updated_at)
+       VALUES ($id, $name, $price, $wishlist, $shop, $desc, $tags, $img, $url, $published, $soldOut, datetime('now'))
+       ON CONFLICT(id) DO UPDATE SET
+         name = excluded.name, price = excluded.price, wishlist_count = excluded.wishlist_count,
+         shop_name = excluded.shop_name, description = excluded.description, tags = excluded.tags,
+         image_url = excluded.image_url, url = excluded.url, published_at = excluded.published_at,
+         is_sold_out = excluded.is_sold_out, updated_at = datetime('now')`,
+      {
+        $id: String(item.id),
+        $name: item.name || '',
+        $price: item.price || '',
+        $wishlist: item.wishlistCount ?? 0,
+        $shop: (item.shop && item.shop.name) || '',
+        $desc: (item.description || '').slice(0, 2000),
+        $tags: JSON.stringify(item.tags || []),
+        $img: (item.images && item.images[0] && item.images[0].original) || '',
+        $url: item.url || '',
+        $published: item.publishedAt || '',
+        $soldOut: item.isSoldOut ? 1 : 0,
+      }
+    );
+  }
+
+  /** BOOTH 商品快照读取（无缓存返回 null） */
+  getBoothItemCache(id) {
+    const rows = this._query(
+      `SELECT id, name, price, wishlist_count AS wishlistCount, shop_name AS shopName,
+              description, tags, image_url AS imageUrl, url, published_at AS publishedAt,
+              is_sold_out AS isSoldOut, updated_at AS updatedAt
+       FROM booth_items WHERE id = $id`,
+      { $id: String(id) }
+    );
+    const r = rows[0];
+    if (!r) return null;
+    try { r.tags = JSON.parse(r.tags || '[]'); } catch { r.tags = []; }
+    return r;
+  }
+
+  /** 按收藏数排序的商品快照列表（趋势跟踪用） */
+  listBoothItems({ sortBy = 'wishlist', limit = 20, minWishlist = 0 } = {}) {
+    const order = sortBy === 'wishlist' ? 'wishlist_count DESC' : 'updated_at DESC';
+    const rows = this._query(
+      `SELECT id, name, price, wishlist_count AS wishlistCount, shop_name AS shopName,
+              image_url AS imageUrl, url, is_sold_out AS isSoldOut, updated_at AS updatedAt
+       FROM booth_items WHERE wishlist_count >= $minWishlist
+       ORDER BY ${order} LIMIT $limit`,
+      { $minWishlist: minWishlist, $limit: Math.max(1, Math.min(100, limit)) }
+    );
+    return rows;
+  }
+
+  /** 记录一次 BOOTH 搜索（结果 id 列表入历史表） */
+  recordBoothSearch(query, resultIds) {
+    this._run(
+      `INSERT INTO booth_search_history (query, result_ids, result_count, created_at)
+       VALUES ($query, $ids, $count, datetime('now'))`,
+      { $query: query, $ids: JSON.stringify(resultIds || []), $count: (resultIds || []).length }
+    );
+  }
+
+  /** 最近搜索历史（含每次结果的商品快照信息） */
+  getBoothSearches({ limit = 10 } = {}) {
+    const rows = this._query(
+      `SELECT id, query, result_ids AS resultIds, result_count AS resultCount, created_at AS createdAt
+       FROM booth_search_history ORDER BY id DESC LIMIT $limit`,
+      { $limit: Math.max(1, Math.min(50, limit)) }
+    );
+    for (const r of rows) {
+      try { r.resultIds = JSON.parse(r.resultIds || '[]'); } catch { r.resultIds = []; }
+    }
+    return rows;
+  }
+
   /** 云端收藏标记：favorite_world 成功后写本地 world_cache（Issue #25），世界不存在时插入兜底行 */
   setWorldFavorited({ worldId, favorited = 1 }) {
     this._run(

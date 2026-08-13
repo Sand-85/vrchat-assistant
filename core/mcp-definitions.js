@@ -730,13 +730,36 @@ export const CUSTOM_TOOLS = [
   },
 {
     name: 'get_booth_item',
-    description: '[query·素材] Get a single BOOTH item detail by item id (booth.pm/ja/items/{id}). Returns name, price, description, tags, images (array of {original, resized, caption} objects — use images[0].original as the cover URL), shop/seller, publishedAt, isSoldOut, wishlistCount (收藏数), variations, url. NOTE: purchase/download counts are not publicly visible (0 anonymously).',
+    description: '[query·素材] Get a single BOOTH item detail by item id (booth.pm/ja/items/{id}). Returns name, price, description, tags, images (array of {original, resized, caption} objects — use images[0].original as the cover URL), shop/seller, publishedAt, isSoldOut, wishlistCount (收藏数), variations, url. NOTE: purchase/download counts are not publicly visible (0 anonymously). Results are cached locally (booth_items table): cached:true returns the snapshot without hitting BOOTH; forceRefresh:true bypasses the cache.',
     inputSchema: {
       type: 'object',
       properties: {
         itemId: { type: 'string', description: 'BOOTH item id (numeric, from item URL /ja/items/{id})' },
+        forceRefresh: { type: 'boolean', default: false, description: 'Bypass local cache and fetch fresh data from BOOTH' },
       },
       required: ['itemId'],
+    },
+  },
+{
+    name: 'get_booth_history',
+    description: '[query·素材] List BOOTH items previously queried (local booth_items snapshot cache). Sorted by wishlistCount (热度) or updatedAt; supports minWishlist filter for trend tracking (which items are gaining popularity).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        sortBy: { type: 'string', default: 'wishlist', description: 'wishlist (by wishlistCount desc) | updated (by last queried)' },
+        limit: { type: 'number', default: 20, description: 'Max results (1-100, default 20)' },
+        minWishlist: { type: 'number', default: 0, description: 'Only items with wishlistCount >= this value' },
+      },
+    },
+  },
+{
+    name: 'get_booth_searches',
+    description: '[query·素材] List recent BOOTH search history (query, result item ids, result count, timestamp).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        limit: { type: 'number', default: 10, description: 'Max results (1-50, default 10)' },
+      },
     },
   },
 
