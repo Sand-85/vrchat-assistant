@@ -29,7 +29,9 @@ metadata:
 | `search_planet_worlds` | **PlanetVRC 地图检索**（planetvrchat.net 日文世界目录）：关键词搜索 → 世界名/wrld_id/平台/分类/收藏数；适合 VRChat API 搜不到的日文/小众图。limit 最大 8（每个结果抓详情页补 wrld_id，约 1-2s/个） |
 | `recommend_planet_worlds` | **PlanetVRC 推荐排行**：sort=popular（访问者数最多）/ new（最新发布）/ updated（最新更新）→ 世界+wrld_id+最大人数+访问量+收藏数+公开日 |
 | `search_booth_items` | **BOOTH 素材检索**（2026-08-13 新增）：booth.pm 关键词搜索 VRChat 素材 → 名称/价格/收藏数（wishlistCount=热度）/卖家/标签。`detail=false` 快速列表；默认补详情（~0.5s/个，max 10）。**下载量/销量 Booth 不公开**（匿名恒 0），收藏数作热度信号 |
-| `get_booth_item` | **BOOTH 单品详情**：按 itemId 查商品 → 名称/价格/描述/标签/图片/卖家/发布时间/收藏数/变体 |
+| `get_booth_item` | **BOOTH 单品详情**：按 itemId 查商品 → 名称/价格/描述/标签/图片/卖家/发布时间/收藏数/变体。**本地缓存**：`cached:true` 命中快照，`forceRefresh` 强制实时 |
+| `get_booth_history` | **BOOTH 查询历史**：本地缓存商品快照，按收藏数/更新时间排序 + `minWishlist` 趋势过滤 |
+| `get_booth_searches` | **BOOTH 搜索历史**：最近搜索词 + 结果 + 时间 |
 | `backup_database` | 立即备份数据库（WAL 在线备份，保留最近 2 份到 backups/）；服务启动 + 每 24h 自动备份 |
 | `get_friend_events` | 某好友的事件历史（本地库） |
 | `get_recent_events` | 最新事件流 |
