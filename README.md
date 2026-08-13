@@ -186,6 +186,8 @@ mcp_servers:
 | `search_worlds` | 按名字搜索世界（英文/日文走 API；中文自动加本地缓存兜底） |
 | `search_planet_worlds` | **PlanetVRC 地图检索**（2026-08-13 新增）：planetvrchat.net 日文世界目录关键词搜索 → 世界名/wrld_id/平台/分类/收藏数；适合 VRChat API 搜不到的日文/小众图。`limit` 最大 8（每个结果抓详情页补 wrld_id/人数/访问量） |
 | `recommend_planet_worlds` | **PlanetVRC 地图推荐**（2026-08-13 新增）：按访问量（热门）/发布日期（新作）/更新时间排行拉取 PlanetVRC 世界目录 Top N，结构与搜索一致 |
+| `search_booth_items` | **BOOTH 素材检索**（2026-08-13 新增）：booth.pm（pixiv 数字商品平台）关键词搜索 VRChat 素材（avatar/衣装/3D 模型等）→ 名称/价格/收藏数（wishlistCount=热度）/卖家/标签/售罄状态。`detail=false` 快速列表（仅 id+名称）；默认 `detail=true` 逐个补详情（~0.5s/个，最多 10 个）。注：**下载量/销量 Booth 不公开**（匿名恒为 0），用收藏数作热度信号 |
+| `get_booth_item` | **BOOTH 单品详情**：按 itemId 查商品 → 名称/价格/描述/标签/图片/卖家/发布时间/收藏数/变体。注：下载量/销量不公开 |
 
 ### 事件历史
 

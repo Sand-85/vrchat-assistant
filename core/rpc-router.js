@@ -62,6 +62,11 @@ import {
 } from './handlers/planet.js';
 
 import {
+  handleSearchBoothItems,
+  handleGetBoothItem,
+} from './handlers/booth.js';
+
+import {
   handleGetBoopEmojis,
   handleUploadEmoji,
   handleUploadPrint,
@@ -304,6 +309,12 @@ export async function handleRpc(rpc, session, res) {
             break;
           case 'recommend_planet_worlds':
             result = await handleRecommendPlanetWorlds(args);
+            break;
+          case 'search_booth_items':
+            result = await handleSearchBoothItems(args);
+            break;
+          case 'get_booth_item':
+            result = await handleGetBoothItem(args);
             break;
           case 'backup_database':
             result = await handleBackupDatabase();
