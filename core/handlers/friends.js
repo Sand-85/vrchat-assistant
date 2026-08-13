@@ -76,15 +76,24 @@ export async function handleSearchUsers({ query, limit = 10 }) {
   const { api } = ctx;
   const r = await api._request('GET', `/users?search=${encodeURIComponent(query)}&n=${limit}`);
   if (r.status !== 200) throw new Error(`API error: ${r.status}`);
+
+  // VRChat API 的 /users?search= 是子串模糊匹配：当查询含 API 无法精确命中的部分
+  // （如中文/特殊字符）时，会退化匹配查询中的 ASCII 尾巴，返回完全不相关的用户
+  // （实测 query="不存在的名字xyz" 返回一堆名字含 "xyz" 的无关用户）。
+  // 这里做客户端二次过滤：displayName 必须包含完整查询串（不区分大小写）才算命中，
+  // 剔除 API 的退化匹配结果。正常模糊搜索语义不受影响（"abc" 仍命中 "Abc~" 等）。
+  const q = query.toLowerCase();
   return {
     query,
-    results: (Array.isArray(r.data) ? r.data : []).map(u => ({
-      userId: u.id,
-      displayName: u.displayName,
-      bio: (u.bio || '').slice(0, 100),
-      status: u.status,
-      isFriend: u.isFriend,
-    })),
+    results: (Array.isArray(r.data) ? r.data : [])
+      .filter(u => u.displayName && u.displayName.toLowerCase().includes(q))
+      .map(u => ({
+        userId: u.id,
+        displayName: u.displayName,
+        bio: (u.bio || '').slice(0, 100),
+        status: u.status,
+        isFriend: u.isFriend,
+      })),
   };
 }
 
