@@ -73,8 +73,9 @@ export async function handleGetFriendInfo({ userId, displayName }) {
 }
 
 export async function handleSearchUsers({ query, limit = 10 }) {
-  const { api } = ctx;
-  const r = await api._request('GET', `/users?search=${encodeURIComponent(query)}&n=${limit}`);
+  const { api, storage } = ctx;
+  const n = Math.max(1, Math.min(50, Number(limit) || 10));
+  const r = await api._request('GET', `/users?search=${encodeURIComponent(query)}&n=${n}`);
   if (r.status !== 200) throw new Error(`API error: ${r.status}`);
 
   // VRChat API 的 /users?search= 是子串模糊匹配：当查询含 API 无法精确命中的部分
@@ -83,18 +84,37 @@ export async function handleSearchUsers({ query, limit = 10 }) {
   // 这里做客户端二次过滤：displayName 必须包含完整查询串（不区分大小写）才算命中，
   // 剔除 API 的退化匹配结果。正常模糊搜索语义不受影响（"abc" 仍命中 "Abc~" 等）。
   const q = query.toLowerCase();
-  return {
-    query,
-    results: (Array.isArray(r.data) ? r.data : [])
-      .filter(u => u.displayName && u.displayName.toLowerCase().includes(q))
-      .map(u => ({
-        userId: u.id,
-        displayName: u.displayName,
-        bio: (u.bio || '').slice(0, 100),
-        status: u.status,
-        isFriend: u.isFriend,
-      })),
-  };
+  const apiResults = (Array.isArray(r.data) ? r.data : [])
+    .filter(u => u.displayName && u.displayName.toLowerCase().includes(q))
+    .map(u => ({
+      userId: u.id,
+      displayName: u.displayName,
+      bio: (u.bio || '').slice(0, 100),
+      status: u.status,
+      isFriend: u.isFriend,
+    }));
+
+  // API 无匹配时回退：优先在本地好友库模糊搜索（display_name / memo 含查询字眼）。
+  // 覆盖 API 中文搜索差 / 昵称备注场景——好友可能只有中文备注名或 API 搜不到。
+  // 仅返回本地好友，不额外调用 API，命中后标记 source 便于区分。
+  if (apiResults.length === 0) {
+    const localHits = storage.searchFriends(query)
+      .filter(f => f.display_name || f.memo)
+      .slice(0, n)
+      .map(f => ({
+        userId: f.user_id,
+        displayName: f.display_name || f.memo,
+        bio: f.memo || '',
+        status: f.status || '',
+        isFriend: true,
+        source: 'local_friends',
+        trustLevel: f.trust_level || null,
+        online: !!f.is_online,
+      }));
+    return { query, results: localHits, fallback: 'local_friends' };
+  }
+
+  return { query, results: apiResults };
 }
 
 export async function handleGetMutualFriends({ userId, displayName, limit = 100 }) {
