@@ -60,6 +60,11 @@ import {
   handleSearchPlanetWorlds,
   handleRecommendPlanetWorlds,
 } from './handlers/planet.js';
+import {
+  handleSearchBoothItems,
+  handleGetBoothItem,
+} from './handlers/booth.js';
+
 
 import { handleRecommendWorlds } from './handlers/recommend-worlds.js';
 
@@ -315,6 +320,12 @@ export async function handleRpc(rpc, session, res) {
             break;
           case 'search_planet_worlds':
             result = await handleSearchPlanetWorlds(args);
+            break;
+          case 'search_booth_items':
+            result = await handleSearchBoothItems(args);
+            break;
+          case 'get_booth_item':
+            result = await handleGetBoothItem(args);
             break;
           case 'recommend_planet_worlds':
             result = await handleRecommendPlanetWorlds(args);
