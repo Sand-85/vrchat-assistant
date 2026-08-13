@@ -50,7 +50,7 @@ metadata:
 
 - **搜索页**：`https://booth.pm/ja/search/{关键词}?page=N`（HTML，每页约 60 个商品，关键词用 `encodeURIComponent`）
 - **商品详情 JSON**：`https://booth.pm/ja/items/{id}.json`（匿名可访问，无需登录）
-  - 关键字段：`name`、`price`、`wish_lists_count`（收藏数=热度）、`shop.name`、`tags`、`images[0].original`（封面原图）、`is_sold_out`、`url`
+  - 关键字段：`name`、`price`、`wish_lists_count`（收藏数=热度）、`shop.name`、`tags`、`images[0].original`（封面原图，**QQ Bot 场景跳过**）、`is_sold_out`、`url`
 - **⚠️ 下载量/销量不可查**：Booth 公开页面不展示下载量，`past_purchase_count` 匿名恒为 0（仅卖家后台可见）——**用收藏数（wish_lists_count）作为热度信号**
 - **网络**：booth.pm / booth.pximg.net 国内需代理；请求带浏览器 UA（`Mozilla/5.0 ... Chrome/126.0 Safari/537.36`）与 `Accept-Language: ja,en;q=0.8`；15s 超时
 - **汇率**：实时查 `https://open.er-api.com/v6/latest/JPY` 的 `rates.CNY`（失败用兜底 ~0.048）
@@ -75,6 +75,10 @@ GET https://booth.pm/ja/items/{id}.json   # 逐个查询，间隔 ~0.4s，单卡
 按 `wish_lists_count` 降序取前 N（默认 15）
 
 ## 展示格式（用户固化要求，严格遵守）
+
+> ⚠️ **QQ Bot 场景（重要）**：当请求来自 QQ Bot（gateway 平台为 `qqbot`，会话上下文带 QQ 平台标识）时，**放弃封面图爬取**——QQ 消息无法渲染外部图片链接，爬取封面纯属浪费（多 N 次 pximg 请求）。此时：
+> - 封面列省略，格式降级为：`商品名称（汉化） | 商家名 | 价格 | 人民币价 | 热度 | 链接`
+> - 其余字段规则不变；数据采集流程中跳过 `images[0].original` 的获取/输出
 
 每行商品按此顺序、用 ` | ` 分隔：
 
