@@ -18,6 +18,32 @@ metadata:
 - 「展示 Booth 商品」/「附封面展示」
 - 用户要求查 VRChat 相关素材（avatar/衣装/3D 模型）在 Booth 的售价与热度
 
+## ⚠️ 每次调用必须主动询问（用户固化要求）
+
+**每次触发本 skill 时，先询问用户是否使用落库缓存功能**（不要直接查）：
+
+> 询问示例：「本次查询要使用 BOOTH 本地缓存吗？（是 = 查过的商品走本地快照/可看查询历史；否 = 每次都实时抓取 BOOTH）」
+
+- 用户回答**是**：走落库流程（见下「落库缓存功能」章节），可用 `get_booth_history`/`get_booth_searches` 查历史
+- 用户回答**否**：直接实时抓取（`get_booth_item` 带 `forceRefresh: true`，跳过缓存）
+- 用户未明确回答时，默认询问一次后再动手（QQ Bot 场景同样询问，简短形式）
+- 询问后记住本次选择，同一会话内连续查询不再重复询问（除非用户主动改口）
+
+## 落库缓存功能（并入本 skill，Issue #28 实现）
+
+BOOTH 查询结果**自动落库**（本地 SQLite `booth_items` / `booth_search_history` 表，旁路缓存——落库失败不影响实时返回）：
+
+| 工具 | 说明 |
+|------|------|
+| `search_booth_items` | 搜索命中即 upsert 商品快照到 `booth_items`，记录搜索历史 |
+| `get_booth_item` | 单品查询命中即落库；**缓存命中返回 `cached: true`**（不抓 BOOTH）；`forceRefresh: true` 强制实时 |
+| `get_booth_history` | 查已落库商品快照（按收藏数/更新时间排序，`minWishlist` 趋势过滤）——"上周查过哪件衣服" |
+| `get_booth_searches` | 查搜索历史（搜索词 + 结果 + 时间） |
+
+- 收藏数（wishlistCount）是 BOOTH 唯一公开热度信号，落库后可做**趋势跟踪**（哪件在涨、接近售罄）
+- 重复搜索同词优先走缓存，避免触发 booth.pm 限流
+- 服务重启数据仍在（SQLite 持久化）；老库升级自动建表（IF NOT EXISTS 幂等）
+
 ## 浏览器访问流程（重要修正）
 
 **优先使用电脑的默认浏览器**，而非临时启动的调试实例：
