@@ -12,6 +12,7 @@ import path from 'node:path';
 import net from 'node:net';
 
 import { ctx, log, refreshWatchlistCache } from './core/server-context.js';
+import { initLogger, getLevelName } from './core/logger.js';
 import { recordOpsLog, setOpsLogSink } from './core/ops-log.js';
 import * as registry from './core/registry.js';
 import { isSafeModeEnabled, DESTRUCTIVE_TOOLS } from './core/safe-mode.js';
@@ -79,6 +80,10 @@ const BACKUP_INTERVAL_MS = 24 * 60 * 60 * 1000; // 每 24h 自动备份
 
 Object.assign(ctx.paths, { __dirname, PORT, HOST, COOKIE_FILE, CRED_FILE, DB_PATH, BACKUP_DIR, BACKUP_INTERVAL_MS });
 
+// ── 日志配置 → 写入 ctx.paths（供其他模块/插件查询）──
+// LOG_DIR/LOG_LEVEL/LOG_FORMAT 由 logger 自行从 env 解析，这里只在 main() 初始化后回填可读值
+// 见 main() 顶部 initLogger() 逻辑
+
 // ── WebSocket 事件 → 好友状态更新 ──
 async function _updateFriendState(event) {
   const { friendState } = ctx;
@@ -128,7 +133,9 @@ async function _refreshOnlineState() {
       displayName: f.displayName,
       location: f.location || '',
       worldId: f.worldId || (f.location || '').split(':')[0],
-      isOnline: true,
+      // 在线口径与 MCP get_online_friends 一致：仅「有有效 location」计在线（offline=false 返回含
+      // active/菜单中用户，location 为空者不算在线——issue #114 ⚠️2 复测遗留修复）
+      isOnline: !!(f.location && f.location !== 'offline'),
     })));
 
     // 断线窗口对账：WS 断开期间的好友下线事件会错过（下线不再广播），本地状态会卡在「在线」。
@@ -220,8 +227,12 @@ async function _syncFriendAvatars() {
         const tl = f.trustLevel || inferTrustFromTags(f.tags);
         if (!av && !ic && !tl) continue;
         const ex = storage.getFriend(f.id);
-        if (ex && (ex.avatar_image_url || ex.user_icon) && ex.trust_level) continue; // 头像+信任等级都有则不覆盖
-        storage.upsertFriend({ userId: f.id, avatarImageUrl: av, userIcon: ic, trustLevel: tl });
+        // issue #127 补漏：好友列表 API 响应带 f.displayName，但此前 upsert 未传 displayName，
+        // 离线好友（无 WS 事件带名字）的 display_name 永远为空 → 前端显示 '?'。故：
+        // ① 跳过条件要求 display_name 也已填（否则名字空的好友被 continue 漏掉）；
+        // ② upsert 补传 displayName，下次头像同步即回填离线好友名字。
+        if (ex && (ex.avatar_image_url || ex.user_icon) && ex.trust_level && ex.display_name) continue; // 头像+信任等级+display_name 都有则不覆盖
+        storage.upsertFriend({ userId: f.id, displayName: f.displayName, avatarImageUrl: av, userIcon: ic, trustLevel: tl });
         updated++;
       }
       offset += r.data.length;
@@ -251,10 +262,14 @@ async function _seedTrackedNonFriends() {
       const del = ctx.storage.run(`DELETE FROM tracked_non_friends WHERE user_id = $u`, { $u: selfId });
       if (del.changes > 0) log(`🧹 追踪列表移除误导入的自己（${selfId.slice(0, 12)}…）`);
     }
+    // 自动导入上限（issue #114 ⚠️3 复测遗留修复）：仅导入近 30 天出现过的非好友，最多 100 人——
+    // 长历史全量导入会数百上千行，每小时逐人拉资料触发 VRChat 限流；手动添加不受此限
     const rows = ctx.storage.query(
       `SELECT user_id, MAX(display_name) AS dn FROM events
        WHERE user_id LIKE 'usr_%' AND user_id != ''
-       GROUP BY user_id`
+         AND created_at >= datetime('now', '-30 days')
+       GROUP BY user_id
+       LIMIT 100`
     );
     let added = 0;
     for (const r of rows) {
@@ -340,11 +355,28 @@ function _recordNonFriendChange(userId, displayName, userObj, av) {
   const { storage } = ctx;
   const curBio = userObj.bio || '';
   const lastBio = storage.query(
-    `SELECT content_json FROM events WHERE user_id=$u AND type='friend-update'
+    `SELECT content_json, created_at FROM events WHERE user_id=$u AND type='friend-update'
      AND json_extract(content_json,'$.type')='bio' ORDER BY id DESC LIMIT 1`, { $u: userId });
   let prevBio = '';
   if (lastBio.length) { try { prevBio = (JSON.parse(lastBio[0].content_json).bio || ''); } catch { /* 脏数据忽略 */ } }
-  if (!lastBio.length || prevBio !== curBio) {
+  // bio 刷屏防护：①unicode NFC 归一化比较（emoji/组合字符在不同刷新返回的字节不稳定，
+  // 归一化后相等视为无变化）；②时间窗去重——同用户 5 分钟内已记录过 bio 事件则跳过
+  // （VRChat 编辑 bio 时逐字保存，逐次抓取内容不同会高频产生事件）。
+  // bio 刷屏彻底方案:过滤 U+FFFD 后剥离标点只比核心文字(乱码会随机吞字符,标点差异全忽略)——
+  // 例: '最好的' vs '最好'+U+FFFD 剥离后都归一, emoji/冒号/空格差异不误判
+  // 根源修复(Buffer chunk 解码)后乱码不再产生,此处只需 NFC 归一化(规范等价) + 防御性滤 U+FFFD,
+  // 不做核心文字剥离——真实微小变化(标点/emoji 增减)也要记录
+  const norm = (x) => String(x || '').replace(/\uFFFD/g, '').normalize('NFC');
+
+  const bioChanged = norm(prevBio) !== norm(curBio);
+  if (bioChanged) {
+    const recent = lastBio[0] && lastBio[0].created_at;
+    if (recent) {
+      const dt = (new Date().getTime() - new Date(recent).getTime()) / 1000;
+      if (dt >= 0 && dt < 300) return;  // 5 分钟内已有 bio 事件，跳过本次(仅防 VRChat 编辑中逐字保存连发)
+    }
+  }
+  if (!lastBio.length || bioChanged) {
     storage.insertEvent({
       type: 'friend-update', userId, displayName,
       contentJson: { userId, displayName, type: 'bio', bio: curBio, previousBio: prevBio, avatarImageUrl: av },
@@ -486,6 +518,56 @@ function registerCoreServices(loader, ctx) {
     loader.serviceOwners.set(name, 'core');
   }
 
+  // 群组信息解析服务（issue #118：缓存优先 + API 回填，供 events 插件等 consume）。
+  // 复用 core/domains/cache-store.js 的 getGroupCached/upsertGroupCache（TTL 7 天，与周报一致），
+  // 命中缓存零限流 API；未命中才经 rateLimiter 拉 /groups/{id} 并回填 group_cache。
+  loader.services.set('groups.resolve', async ({ groupId, force = false } = {}) => {
+    if (!groupId || !String(groupId).startsWith('grp_')) throw new Error('groupId 必填且以 grp_ 开头');
+    const cached = ctx.storage.getGroupCached(groupId);
+    const TTL = 7 * 24 * 60 * 60 * 1000;
+    const _ct = Date.parse(String(cached.updated_at).replace(' ', 'T') + 'Z');
+    if (!force && cached && cached.name && Number.isFinite(_ct) && (Date.now() - _ct) < TTL) {
+      return {
+        groupId,
+        name: cached.name,
+        description: cached.description || '',
+        memberCount: cached.member_count || 0,
+        iconUrl: cached.icon_url || '',
+        source: 'cache',
+      };
+    }
+    const r = await ctx.rateLimiter.execute(() => ctx.api._request('GET', `/groups/${encodeURIComponent(groupId)}`));
+    if (r.status === 200 && r.data) {
+      const d = r.data;
+      ctx.storage.upsertGroupCache({
+        groupId,
+        name: d.name || '',
+        description: d.description || '',
+        memberCount: d.memberCount || 0,
+      });
+      return {
+        groupId,
+        name: d.name || '',
+        description: d.description || '',
+        memberCount: d.memberCount || 0,
+        iconUrl: d.iconUrl || '',
+        source: 'api',
+      };
+    }
+    throw new Error(`groups.resolve 失败: ${r.status}`);
+  });
+  loader.serviceOwners.set('groups.resolve', 'core');
+
+  // 群组缓存写服务（issue #118）：供插件把搜索/采集得到的群组信息回填 group_cache，
+  // 让后续 groups.resolve 命中缓存。仅写 name/description/member_count（group_cache 无
+  // icon_url 列，icon 暂不入缓存；活动自带 icon_url 不受影响）。
+  loader.services.set('groups.cache', ({ groupId, name, description, memberCount } = {}) => {
+    if (!groupId || !String(groupId).startsWith('grp_')) throw new Error('groupId 必填且以 grp_ 开头');
+    ctx.storage.upsertGroupCache({ groupId, name: name || '', description: description || '', memberCount: memberCount || 0 });
+    return { ok: true };
+  });
+  loader.serviceOwners.set('groups.cache', 'core');
+
   // 认证与网络配置服务（供 auth-guard 插件查询，owner='core'）
   loader.services.set('core.authConfig', () => ({
     token: process.env.VRC_MONITOR_AUTH_TOKEN || process.env.VRC_MONITOR_API_KEY || null,
@@ -517,9 +599,16 @@ async function main() {
   try {
     APP_VERSION = JSON.parse(readFileSync(new URL('./package.json', import.meta.url), 'utf-8')).version;
   } catch { /* 读不到则显示 unknown，不阻断启动 */ }
-  console.log('══════════════════════════════════════════════');
-  console.log(`  VRChat-Assistant v${APP_VERSION}`);
-  console.log('══════════════════════════════════════════════\n');
+
+  // 0. 初始化日志（必须在任何业务输出之前；logger 从 env 自读全部 VRC_MONITOR_LOG_*）
+  //    返回的 state 含 dir/level/format，回写 ctx.paths 供其他模块/插件查询
+  const logState = initLogger();
+  Object.assign(ctx.paths, { LOG_DIR: logState.dir, LOG_LEVEL: getLevelName(logState.level), LOG_FORMAT: logState.format });
+
+  log('══════════════════════════════════════════════');
+  log(`  VRChat-Assistant v${APP_VERSION}`);
+  log(`  LOG_DIR=${ctx.paths.LOG_DIR} | LOG_LEVEL=${ctx.paths.LOG_LEVEL} | LOG_FORMAT=${ctx.paths.LOG_FORMAT}`);
+  log('══════════════════════════════════════════════\n');
 
   // 0. 端口预检：MCP 端口已被占用 → 立即退出（防双实例并存 → OTP 验证码互抢循环，issue #49）
   //    必须前置：认证+OTP 抓取/WebSocket 在 main() 靠后位置，若等 listen 阶段才发现端口冲突，

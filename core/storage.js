@@ -11,6 +11,10 @@ import { readFileSync, mkdirSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import { backupDatabase } from './backup.js';
+import { getLogger } from './logger.js';
+
+// 命名日志：storage 组件标签，替代原裸 console.*（保留 [storage] 语义由 [storage] 标签承接）
+const log = getLogger('storage');
 import { SocialAnalytics } from './analytics/social.js';
 import { WorldStore } from './domains/world-store.js';
 import { CacheStore } from './domains/cache-store.js';
@@ -58,7 +62,7 @@ export class Storage {
       const xddl = readFileSync(X_WORLDS_DDL_PATH, 'utf-8');
       this.db.exec(xddl);
     } catch (e) {
-      console.warn(`[storage] x-worlds DDL 加载失败: ${e.message}`);
+      log.warn(`x-worlds DDL 加载失败: ${e.message}`);
     }
     // 迁移：旧库 tracked_non_friends 缺状态列（非好友追踪在线状态展示，幂等）
     const tnfCols = this._query(`PRAGMA table_info(tracked_non_friends)`);
@@ -376,8 +380,14 @@ export class Storage {
     const params = { $userId: userId };
     for (const [col, key] of Object.entries(columns)) {
       if (friend[key] === undefined) continue;  // 未传 → 不更新该列
-      params[`$${col}`] = norm[key](friend[key]);
-      setCols.push(`${col}=COALESCE($${col}, ${col})`);
+      const v = norm[key](friend[key]);
+      // display_name 空串不覆盖已有名字（issue #127）：offline/空 payload 事件会以 ''
+      // 覆盖已存名字，导致离线好友显示 '?'。UPDATE 时 CASE WHEN 非空才更新；参数始终设置供 INSERT。
+      const setExpr = col === 'display_name'
+        ? `display_name=CASE WHEN $display_name <> '' THEN $display_name ELSE display_name END`
+        : `${col}=COALESCE($${col}, ${col})`;
+      params[`$${col}`] = v;
+      setCols.push(setExpr);
     }
     if (setCols.length === 0) return;
 

@@ -71,7 +71,7 @@ onUnmounted(() => clearInterval(timer));
     <div v-else-if="!shown.length" class="empty" style="padding:24px">暂无日志记录（服务运行平稳时此处安静是正常的）</div>
     <div v-else class="lv-list">
       <div v-for="x in shown" :key="x.id" class="lv-row">
-        <span class="lv-time mono" :title="x.created_at">{{ time(x.created_at) }}<small>{{ date(x.created_at) }}</small></span>
+        <span class="lv-time mono" :title="x.createdAt || x.created_at">{{ time(x.createdAt || x.created_at) }}<small>{{ date(x.createdAt || x.created_at) }}</small></span>
         <Tag :value="KIND_LABEL[x.kind] || x.kind" :severity="x.kind === 'ws' ? 'info' : 'contrast'" rounded />
         <Tag :value="LEVEL[x.level]?.label || x.level" :severity="LEVEL[x.level]?.severity || 'secondary'" rounded><i class="pi lv-ico" :class="LEVEL[x.level]?.ico || 'pi-circle'"></i></Tag>
         <span class="lv-msg" :title="x.message">{{ x.message }}</span>

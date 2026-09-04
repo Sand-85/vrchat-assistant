@@ -12,7 +12,12 @@
 import WebSocket from 'ws';
 import { HttpsProxyAgent } from 'https-proxy-agent';
 import { ctx } from './server-context.js';
+import { getLogger } from './logger.js';
+import { recordOpsLog } from './ops-log.js';
 import { notifier } from './notifier.js';
+
+// 命名日志：WS 组件标签，替代原裸 console.*（保留 [WS] 语义由 [ws] 标签承接）
+const log = getLogger('ws');
 
 // WS 代理地址：优先 VRC_MONITOR_WS_PROXY，其次标准 HTTPS_PROXY/HTTP_PROXY，最后内置默认（兼容旧部署）
 // 注意：代理可能含凭据，日志中不要打印完整 URL
@@ -99,7 +104,7 @@ export class WsManager {
     // 认证冷却检查：避免高频 Basic auth 触发 VRChat 登录限流
     if (Date.now() < this.authCooldownUntil) {
       const remaining = Math.ceil((this.authCooldownUntil - Date.now()) / 1000);
-      console.log(`[WS] ⏳ 认证冷却中，${remaining} 秒后重试...`);
+      log.info(`⏳ 认证冷却中，${remaining} 秒后重试...`);
       this._scheduleReconnect();
       return;
     }
@@ -111,13 +116,13 @@ export class WsManager {
       } catch (authErr) {
         // 自动 2FA 通道：邮箱 OTP（otpFetcher）或 TOTP（api.totpFetcher，配置 totp_secret 后启用）
         if (authErr.needsOtp && (this.otpFetcher || this.api.totpFetcher)) {
-          console.log('[WS] ⚠️ 认证需要 2FA，尝试自动获取...');
+          log.info('⚠️ 认证需要 2FA，尝试自动获取...');
           try {
             await this.api.ensureAuthWithAutoOtp(this.otpFetcher);
           } catch (otpErr) {
             if (otpErr.needsTotp) {
               ctx.serverState.needsTotp = true;
-              console.log('[WS] 🔑 账号需要 TOTP 验证码：自动登录未成功，可调用 MCP 工具 submit_totp 提交');
+              log.info('🔑 账号需要 TOTP 验证码：自动登录未成功，可调用 MCP 工具 submit_totp 提交');
               notifier.notifyAuth('needsTotp', '账号需要 TOTP 验证码，服务暂停——请调用 submit_totp 提交当前验证码');
             } else {
               notifier.notifyAuth('reauthFailed', `WS 重连自动认证失败：${otpErr.message}`);
@@ -175,7 +180,7 @@ export class WsManager {
 
       if (!connectedDirectly) {
         // 直连失败，通过代理重试
-        console.log('[WS] 直连超时，尝试代理...');
+        log.info('直连超时，尝试代理...');
         if (this.ws) { try { this.ws.close(); } catch {} }
         options.agent = new HttpsProxyAgent(WS_PROXY);
         options.handshakeTimeout = 15000;
@@ -194,16 +199,20 @@ export class WsManager {
       }
 
     } catch (err) {
-      console.error(`[WS] 连接失败: ${err.message}`);
+      log.error(`连接失败: ${err.message}`);
       this._scheduleReconnect();
     }
   }
 
   _onOpen() {
+    const lastAttempt = this.attempt; // 归零前记录本次成功前的重连次数（审核建议）
     this.attempt = 0;
     this.connectedAt = new Date();
     this._setStatus('connected');
-    console.log(`[WS] ✅ 已连接 (${this.connectedAt.toISOString().slice(11, 19)})`);
+    log.info(`✅ 已连接 (${this.connectedAt.toISOString().slice(11, 19)})`);
+    recordOpsLog('ws', 'info', lastAttempt > 0
+      ? 'WebSocket 已连接（重连成功，第 ' + lastAttempt + ' 次尝试）'
+      : 'WebSocket 已连接（首次连接）');
     
     // 启动心跳
     this._startHeartbeat();
@@ -246,14 +255,15 @@ export class WsManager {
         this.onEvent(event);
       }
     } catch (err) {
-      console.error(`[WS] 解析消息失败: ${err.message}`);
+      log.error(`解析消息失败: ${err.message}`);
     }
   }
 
   _onClose(code, reason) {
     this.disconnectedAt = new Date();
     const reasonStr = reason ? reason.toString() : '无';
-    console.log(`[WS] ⚠️ 断开: code=${code}, reason=${reasonStr}`);
+    log.info(`⚠️ 断开: code=${code}, reason=${reasonStr}`);
+    recordOpsLog('ws', 'warn', 'WebSocket 断开 code=' + code + '（' + reasonStr + '），将自动重连');
 
     this._clearTimers();
     this._setStatus('disconnected');
@@ -265,7 +275,7 @@ export class WsManager {
   }
 
   _onError(err) {
-    console.error(`[WS] ❌ 错误: ${err.message}`);
+    log.error(`❌ 错误: ${err.message}`);
   }
 
   // ── 心跳 ──
@@ -282,7 +292,7 @@ export class WsManager {
         // 设置 pong 超时
         this.heartbeatTimeout = setTimeout(() => {
           if (!this._pongReceived) {
-            console.log('[WS] ⚠️ 心跳超时，主动断开');
+            log.info('⚠️ 心跳超时，主动断开');
             try { this.ws.terminate(); } catch {}
           }
         }, HEARTBEAT_TIMEOUT);
@@ -327,13 +337,14 @@ export class WsManager {
     const cooldownMs = isRateLimited ? 300_000 : 120_000;
     this.authCooldownUntil = Date.now() + cooldownMs;
     const secs = Math.round(cooldownMs / 1000);
-    console.log(`[WS] 🔒 认证失败，冷却 ${secs} 秒后重试${isRateLimited ? ' (限流)' : ''}`);
+    log.info(`🔒 认证失败，冷却 ${secs} 秒后重试${isRateLimited ? ' (限流)' : ''}`);
+    recordOpsLog('ws', 'warn', '认证失败，冷却 ' + secs + ' 秒后重试' + (isRateLimited ? '（限流）' : ''));
   }
 
   _scheduleReconnect() {
     if (!this.shouldReconnect || this._reconnectScheduled) return;
     if (MAX_RECONNECT_ATTEMPTS > 0 && this.attempt >= MAX_RECONNECT_ATTEMPTS) {
-      console.log('[WS] 已达到最大重试次数，停止重连');
+      log.info('已达到最大重试次数，停止重连');
       this._setStatus('error');
       return;
     }
@@ -343,7 +354,8 @@ export class WsManager {
     const delay = RECONNECT_DELAYS[Math.min(this.attempt - 1, RECONNECT_DELAYS.length - 1)];
     this._setStatus('reconnecting');
 
-    console.log(`[WS] 🔄 将在 ${delay} 秒后重连 (第 ${this.attempt} 次)...`);
+    log.info(`🔄 将在 ${delay} 秒后重连 (第 ${this.attempt} 次)...`);
+    recordOpsLog('ws', 'info', '将在 ' + delay + ' 秒后重连（第 ' + this.attempt + ' 次）');
     
     this.reconnectTimer = setTimeout(() => {
       this._connect();

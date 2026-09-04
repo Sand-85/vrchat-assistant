@@ -1,12 +1,25 @@
 // 工具函数（移植自旧 util.js，VRCX 对齐的标准值）
 export const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 
-export const time = (s) => (s ? new Date(s).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' }) : '--:--');
-export const date = (s) => (s ? new Date(s).toLocaleDateString('zh-CN', { month: '2-digit', day: '2-digit' }) : '--/--');
+// 统一时间解析：后端 SQLite 的 datetime('now') 产出无时区 UTC 串 "YYYY-MM-DD HH:MM:SS"，
+// 直接 new Date() 会被当成浏览器本地时间（UTC+8 设备偏移 8 小时，实测 tracked 列表"最近变化 8 小时前"）。
+// 凡无时区标记的 SQLite 格式一律补 'Z' 按 UTC 解析；空格+Z 形态（YYYY-MM-DD HH:MM:SSZ）也按 UTC；
+// ISO（带 Z/T/时区偏移）与数字时间戳原样交给 Date。
+const SQLITE_UTC_RE = /^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(\.\d+)?Z?$/;
+export function parseTs(s) {
+  if (s === null || s === undefined || s === '') return new Date(NaN);
+  if (typeof s === 'number') return new Date(s);
+  const str = String(s);
+  const norm = SQLITE_UTC_RE.test(str) ? str.replace(' ', 'T').replace(/Z$/, '') + 'Z' : str;
+  return new Date(norm);
+}
+
+export const time = (s) => (s ? parseTs(s).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' }) : '--:--');
+export const date = (s) => (s ? parseTs(s).toLocaleDateString('zh-CN', { month: '2-digit', day: '2-digit' }) : '--/--');
 // 相对时间："X 分钟前 / X 小时前 / X 天前 / 日期"
 export function reltime(ts) {
   if (!ts) return '';
-  const t = new Date(ts).getTime();
+  const t = parseTs(ts).getTime();
   if (!Number.isFinite(t)) return '';
   const diff = Date.now() - t;
   if (diff < 60000) return '刚刚';
@@ -18,7 +31,7 @@ export function reltime(ts) {
 // VRCX 风格完整日期时间：YYYY/MM/DD HH:MM:SS
 export function dateTime(s) {
   if (!s) return '—';
-  const d = new Date(s);
+  const d = parseTs(s);
   if (Number.isNaN(d.getTime())) return '—';
   const p = (n) => String(n).padStart(2, '0');
   return `${d.getFullYear()}/${p(d.getMonth() + 1)}/${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
@@ -228,4 +241,7 @@ export const notificationTypeLabels = {
   'group.event.scheduled': '群活动计划',
   moderationWarning: '警告',
   message: '消息',
+  boop: '戳一戳',
+  'twitchdrop.fulfilled': 'Twitch 掉宝到账',
+  'group.event.created': '群活动创建',
 };

@@ -5,6 +5,8 @@
  * tool handler / registry / http-server 模块通过 import { ctx } 使用。
  */
 
+import { initLogger, logger } from './logger.js';
+
 export const ctx = {
   storage: null,
   api: null,
@@ -28,8 +30,7 @@ export const ctx = {
 };
 
 export function log(msg) {
-  const ts = new Date().toISOString().slice(11, 19);
-  console.log(`[${ts}] ${msg}`);
+  logger.info(String(msg));
 }
 
 export function parseLocation(loc) {

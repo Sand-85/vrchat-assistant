@@ -12,6 +12,10 @@
  */
 import { existsSync, mkdirSync, renameSync } from 'node:fs';
 import path from 'node:path';
+import { getLogger } from './logger.js';
+
+// 命名日志：migrate 组件标签，替代原裸 console.*（保留 [migrate] 语义由 [migrate] 标签承接）
+const log = getLogger('migrate');
 
 /**
  * 把根目录旧运行时文件迁移到 data/ 目录（尽量覆盖同名则跳过，避免覆盖 data/ 新数据）。
@@ -53,8 +57,8 @@ export function migrateLegacyData(rootDir, dataDir) {
   // 旧库不会被搬移（可能是用户按临时 workaround 手动 mkdir -p data 启动过一次）。
   // 若无提示，用户会误以为历史数据仍在（假丢失），此处输出 warn 提醒可手动处理。
   if (existsSync(legacyDb) && dataDbExists) {
-    console.warn(
-      `[migrate] 检测到根目录旧库 ${path.relative(rootDir, legacyDb)}，但 data/ 已存在同名库，跳过迁移；` +
+    log.warn(
+      `检测到根目录旧库 ${path.relative(rootDir, legacyDb)}，但 data/ 已存在同名库，跳过迁移；` +
       '若需恢复旧数据请手动处理'
     );
   }
@@ -66,10 +70,10 @@ export function migrateLegacyData(rootDir, dataDir) {
   for (const { from, to, label } of needsMove) {
     try {
       renameSync(from, to);
-      console.log(`[migrate] ${label} -> ${path.relative(rootDir, to)}`);
+      log.info(`${label} -> ${path.relative(rootDir, to)}`);
       moved += 1;
     } catch (e) {
-      console.warn(`[migrate] 移动失败 ${label}: ${e.message}`);
+      log.warn(`移动失败 ${label}: ${e.message}`);
     }
   }
   return moved;

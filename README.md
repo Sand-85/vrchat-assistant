@@ -59,6 +59,29 @@
 - `scripts/prepare_image.py`：上传前图片处理（emoji 方形化 / Prints 16:9 / Gallery 4:3）
 - `scripts/migrate-vrcx0.mjs`：从 VRCX 一键迁移历史数据 — `node scripts/migrate-vrcx0.mjs`
 
+## 📝 日志
+
+服务日志统一走 `core/logger.js`，默认同时写 stdout 与 `<VRC_MONITOR_LOGGER_DIR>/monitor.log`，支持级别/格式/轮转/脱敏。
+
+| 变量 | 默认值 | 说明 |
+|------|--------|------|
+| `VRC_MONITOR_LOGGER_DIR` | `<VRC_MONITOR_DIR>/logs` | 日志文件目录 |
+| `VRC_MONITOR_LOGGER_LEVEL` | `info` | 最低输出级别（debug/info/warn/error/silent） |
+| `VRC_MONITOR_LOGGER_FORMAT` | `text` | 日志格式（`text`/`json`，json 每行为 JSONL，便于 agent 解析） |
+| `VRC_MONITOR_LOGGER_MAX_SIZE` | `10485760` | 单文件轮转阈值字节（默认 10MB） |
+| `VRC_MONITOR_LOGGER_MAX_FILES` | `5` | 保留的已轮转 .gz 份数 |
+| `VRC_MONITOR_LOGGER_SUPPRESS` | - | 逗号分隔子串列表，命中即整条丢弃（如 `ping,keepalive`） |
+| `VRC_MONITOR_LOGGER_CONSOLE` | `1` | 是否同时输出到 stdout（`0` 仅写文件，不建议关闭） |
+| `VRC_MONITOR_LOGGER_COLOR` | `auto` | text 格式是否加 ANSI 色（写文件永远无色） |
+
+排障时可用 JSONL 格式解析：`VRC_MONITOR_LOGGER_FORMAT=json node start-monitor.js` 启动后通过 `jq` 过滤结构化日志，例如：
+
+```bash
+jq -r 'select(.level=="error") | "\(.ts) [\(.name)] \(.msg)"' "$VRC_MONITOR_LOGGER_DIR/monitor.log"
+```
+
+单文件达到 `MAX_SIZE` 时自动轮转压缩为 `.gz`，命名形如 `monitor-YYYYMMDD-HHMMSS-<pid>.log.gz`，最多保留 `MAX_FILES` 份。
+
 ## 🛠 故障排查
 
 **Q: WebSocket 连不上？**

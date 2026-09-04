@@ -12,20 +12,39 @@ const loading = ref(false);
 const removing = ref(new Set());
 
 // 收藏夹 tag → 友好名（worlds0=收藏夹1, worlds1=收藏夹2 ...）
+// 收藏分组列表（/favorites?type=groups 拉取，按 tag 数值序），用于收藏夹编号：
+// 用「实际分组列表顺序」而非 tag 尾号，兼容有/无 worlds0 两种账号（issue 审核反馈）
+let groupsList = [];
 function favName(tag) {
-  // VRC+ 专属夹实际 tag 为 vrcPlusWorlds1-2（大写 W），/i 才能匹配
-  const m = String(tag || '').match(/^(?:vrcplus)?worlds(\d+)$/i);
-  if (m) return (/^vrc/i.test(String(tag)) ? 'VRC+ ' : '') + `收藏夹 ${Number(m[1]) + 1}`;
+  // 世界夹 / VRC+ 夹：按分组列表顺序编号（第 i 个普通世界夹 → 收藏夹 i+1）
+  const worldGroupsOrdered = groupsList.filter((g) => g.type === 'world').sort((a, b) => tagNum(a.tag) - tagNum(b.tag));
+  const vrcOrdered = groupsList.filter((g) => g.type === 'vrcPlusWorld').sort((a, b) => tagNum(a.tag) - tagNum(b.tag));
+  const wIdx = worldGroupsOrdered.findIndex((g) => g.tag === tag);
+  if (wIdx >= 0) return `收藏夹 ${wIdx + 1}`;
+  const vIdx = vrcOrdered.findIndex((g) => g.tag === tag);
+  if (vIdx >= 0) return `VRC+ 收藏夹 ${vIdx + 1}`;
+  // 模型夹 / 好友夹：VRChat tag 从 1 开始（avatars1/2...、friends1/2...）
   const a = String(tag || '').match(/^avatars(\d+)$/);
-  if (a) return `模型夹 ${Number(a[1]) + 1}`;
+  if (a) return `模型夹 ${Number(a[1])}`;
   const f = String(tag || '').match(/^friends(\d+)$/);
-  if (f) return `好友夹 ${Number(f[1]) + 1}`;
+  if (f) return `好友夹 ${Number(f[1])}`;
   return tag || '未分类';
+}
+
+// 提取 tag 尾号（worlds3 → 3；无编号 → MAX，排序放最后）
+function tagNum(tag) {
+  const m = String(tag || '').match(/(\d+)$/);
+  return m ? Number(m[1]) : Number.MAX_SAFE_INTEGER;
 }
 
 async function load() {
   loading.value = true;
   try {
+    // 收藏分组列表（实际分组顺序），用于收藏夹编号（兼容有/无 worlds0 账号）
+    try {
+      const g = await get('/api/dashboard/favorites?type=groups');
+      groupsList = (g && Array.isArray(g.groups)) ? g.groups : [];
+    } catch { groupsList = []; }
     if (!worlds.value) {
       const w = await get('/api/dashboard/favorites?type=worlds&limit=200');
       worlds.value = (w && w.worlds) || [];
@@ -50,13 +69,20 @@ function reload() {
 }
 onMounted(load);
 
+// 收藏夹按 tag 编号排序（worlds1 < worlds2 < ...；未分类/无编号最后），
+// 不依赖 /worlds/favorites 的返回顺序（收藏时间倒序会导致分组顺序乱）
+function sortGroups(entries) {
+  const num = (k) => { const m = String(k || '').match(/(\d+)$/); return m ? Number(m[1]) : Number.MAX_SAFE_INTEGER; };
+  return [...entries].sort((a, b) => (num(a[0]) - num(b[0])) || String(a[0]).localeCompare(String(b[0])));
+}
+
 const worldGroups = computed(() => {
   const g = {};
   for (const w of worlds.value || []) {
     const k = w.favoriteGroup || '未分类';
     (g[k] = g[k] || []).push(w);
   }
-  return Object.entries(g);
+  return sortGroups(Object.entries(g));
 });
 const avatarGroups = computed(() => {
   const g = {};
@@ -64,16 +90,16 @@ const avatarGroups = computed(() => {
     const k = a.group || '未分类';
     (g[k] = g[k] || []).push(a);
   }
-  return Object.entries(g);
+  return sortGroups(Object.entries(g));
 });
-// 好友收藏按夹分组（/favorites?type=friend 记录的 tags[0] = friends0-2）
+// 好友收藏按夹分组（/favorites?type=friend 记录的 tags[0] = friends1/2...）
 const friendGroups = computed(() => {
   const g = {};
   for (const f of friends.value || []) {
     const k = (Array.isArray(f.tags) && f.tags[0]) || '未分类';
     (g[k] = g[k] || []).push(f);
   }
-  return Object.entries(g);
+  return sortGroups(Object.entries(g));
 });
 
 // 收藏夹切换：'all' 全部堆叠 / 具体 tag 只看该夹；刷新后夹消失自动回退全部

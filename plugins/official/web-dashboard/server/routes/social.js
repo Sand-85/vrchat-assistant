@@ -121,7 +121,16 @@ export function registerSocialRoutes(api, dashboardState) {
           const w = await api.consume('dashboard.world', { worldId }).catch(() => null);
           if (w && w.name) { worldName = w.name; worldCover = w.imageUrl || ''; }
         }
-        return { ...n, isGroup, worldId, worldCover, worldName };
+        return {
+          ...n, isGroup, worldId, worldCover, worldName,
+          // 群组通知：展示群组名 + 群组图标（不显示"系统"占位）。
+          // 群组字段兼容多种结构：groupName/groupId(群公告)、ownerName/ownerId(群活动创建)。
+          // title "群名: 标题" 前缀兜底**仅限 group.* 类型**（防 boop/twitchdrop 等非群组通知误伤）。
+          groupName: (n.data && (n.data.groupName || n.data.ownerName)) ||
+            (isGroup ? (String(n.title || '').split(':')[0].trim().replace(/^New event by /i, '')) : '') || '',
+          groupId: (n.data && (n.data.groupId || n.data.ownerId)) || '',
+          groupImageUrl: n.imageUrl || '',
+        };
       };
       const notifications = await Promise.all((currentData.notifications || []).map(enrich));
       sendJson(res, {
@@ -254,7 +263,11 @@ export function registerSocialRoutes(api, dashboardState) {
           lastLogin: user.last_login || '',
           lastPlatform: user.last_platform || '',
           tags: Array.isArray(user.tags) ? user.tags : [],
-          avatarImageUrl: user.currentAvatarImageUrl || user.userIcon || '',
+          avatarImageUrl: (() => {
+            const picked = user.userIcon || user.currentAvatarThumbnailImageUrl || user.currentAvatarImageUrl || '';
+            const m = String(picked).match(/\/file\/(file_[a-f0-9-]+)\//);
+            return m ? `https://api.vrchat.cloud/api/1/image/${m[1]}/1/256` : picked;
+          })(),
         });
       } catch (e) {
         sendJson(res, { error: String(e.message || e) });

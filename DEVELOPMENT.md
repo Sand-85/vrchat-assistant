@@ -94,6 +94,7 @@ PR 由 AI Agent 编写提交（人类只提出需求、不直接编码）。以�
   - `VRC_MONITOR_X_PLAYWRIGHT_INSTANCES`：浏览器抓取入口实例列表，逗号分隔（默认 `https://nitter.tiekoetter.com`）。可配置多个 Nitter 实例作为回退。
   - `VRC_MONITOR_X_PLAYWRIGHT_CHANNEL`：Playwright 浏览器通道（默认 `msedge`）。可选 `msedge`、`chrome`、`chromium`，需已安装对应浏览器且 Playwright 已 `npx playwright install`。
   - `VRC_MONITOR_X_PLAYWRIGHT_TIMEOUT_MS`：浏览器 goto / waitForSelector 超时（默认 45000 ms）。
+  - `VRC_MONITOR_X_RESOLVE_TCO`：t.co 短链解包开关。默认开启（`1`/`true`/空），设 `0` 时关闭。推文里的世界链接常被 X 压缩成 `https://t.co/XXXX` 短链（探跡家もっけい、fox_yata9 等博主的世界推荐全在短链里），t.co 现在返回 **200 HTML + `<meta refresh>`**（非 HTTP 302），抓 body 解析 `URL=` 才能拿到真实 `wrld_` 链接。解包在 `fetchCreatorTweets` 统一入口对三个通道（浏览器/Nitter/SearchTimeline）批量执行（并发 3、单链接超时 8s、整体 30s），失败静默、不影响主流程。
   - **浏览器抓取现在作为 `x_scan_creators` / `x_world_digest` 的默认主通道**（Nitter RSS / SearchTimeline 2026 已失效，保留作降级）。
   - **注意**：Anubis 会拦截无头浏览器，浏览器抓取必须有头（`headless:false`，默认离屏+最小化，窗口置于 `-2400,-2400`）；服务跑在无头 Linux 服务器 / 容器时需要 `xvfb-run` 等提供虚拟显示（该路径待验证）。
 
@@ -119,7 +120,7 @@ PR 由 AI Agent 编写提交（人类只提出需求、不直接编码）。以�
 服务可能被部署进 Docker、K8s 或 NAS 套件里，遵守以下约定：
 
 - **无状态 + 数据卷挂载**：数据库（`data/vrc-monitor.sqlite3`）和 `credentials.json` 应通过挂载卷 / 环境变量提供，容器本身可随时重建。禁止把数据写死在镜像内。
-- **日志走 stdout**：容器 / 进程管理器只采集 stdout，不要新增「写日志文件」的逻辑（或做成可选）。
+- **日志默认写 stdout**：容器 / 进程管理器只采集 stdout，服务必须始终保留 stdout 输出（Hermes 插件 / Docker / systemd 采集都靠它）。如需文件日志（本地排障 / 历史回溯），走 `core/logger.js` 的可选文件输出——它默认同时写 stdout 与 `VRC_MONITOR_LOGGER_DIR` 下的文件，且 stdout 永远保留（`VRC_MONITOR_LOGGER_CONSOLE=0` 可仅关 console，但一般不建议）。不得用独立的「写日志文件」模块绕过 logger。
 - **信号处理**：不假设有 systemd / 服务管理器兜底。进程要优雅处理 `SIGTERM` / `SIGINT`（关闭 WebSocket、正常收尾 SQLite 事务），让容器编排能安全停止。
 - **端口与绑定**：当前绑定 `127.0.0.1:8799` 意味着外部（宿主机 / 其他容器）无法直连；需要对外提供服务时，绑定地址要可配置，且暴露到公网前必须有鉴权（本服务目前无鉴权，默认只允许本机访问是有意为之）。
 - **基础镜像**：better-sqlite3 的原生二进制在 glibc 发行版（如 `node:slim`）上最稳；Alpine（musl）需要确认 prebuilt 可用，或改用 glibc 镜像，别默认 Alpine。
@@ -156,7 +157,7 @@ PR 由 AI Agent 编写提交（人类只提出需求、不直接编码）。以�
   - 文档同步：新增工具必须登记进 `skills/vrc-monitor-agent/SKILL.md`「MCP 工具」章节（**唯一权威工具表**，2026-08-15 决策，避免多表重复维护）；README 的 MCP 工具段与 AGENTS.md 工具列举为采样说明，新增工具后顺带核对（工具清单漂移检测用 `python3 scripts/check-doc-drift.py`）。
   - **限流不要嵌套**（2026-08-09 真实死锁事故）：handler 内部逐请求 `rateLimiter.execute` 时，RPC case 层**不要再包一层** `rateLimiter.execute`——外层执行时 `_processing=true`，内层请求永远排不上队，整个 handler 挂死（`scan_new_worlds` 首版即如此，120s 超时；修复：case 层裸调，内部已逐请求限流）。
 - **错误处理**：异步路径必须有 try/catch 或 Promise 拒绝处理；WebSocket 消息处理不得因单条消息异常导致服务中断。
-- **日志**：沿用现有 `log()` 输出风格（中文 + emoji），不引入额外日志库。
+- **日志**：统一走 `core/logger.js`（自实现，中文 + emoji 风格），用 `getLogger('<组件名>')` 命名子 logger，不要裸 `console.*`（启动失败/凭据缺失/崩溃兜底路径除外）；**禁止引入第三方日志库**（pino/winston 等，与零依赖原则冲突）。日志变量统一 `VRC_MONITOR_LOGGER_*` 前缀（见 AGENTS.md 环境变量表）。
 - **SQL**：建表 / 索引沿用 `core/init-db.sql` 的幂等写法（`IF NOT EXISTS`）；查询一律用参数占位符，禁止字符串拼接 SQL。
 
 ## 6. 测试与 CI

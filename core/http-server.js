@@ -7,7 +7,11 @@
 import http from 'node:http';
 import { randomUUID } from 'node:crypto';
 import { ctx, log } from './server-context.js';
+import { getLogger } from './logger.js';
 import * as registry from './registry.js';
+
+// 命名日志：MCP 协议层（JSON-RPC 往返），请求日志默认降为 debug 级避免 ping/keepalive 刷屏
+const logMCP = getLogger('mcp');
 
 // ── MCP 会话管理 ──
 const sessions = new Map();
@@ -141,7 +145,7 @@ async function handleRequest(req, res) {
       const rpc = JSON.parse(body);
       const sessionId = req.headers['mcp-session-id'];
       const session = getOrCreateSession(sessionId);
-      log(`MCP ${rpc.method || '?'} ${body.slice(0, 60)}...`);
+      logMCP.debug(`MCP ${rpc.method || '?'} ${body.slice(0, 60)}...`);
       await handleRpc(rpc, session, res);
     } catch (err) {
       log(`Parse error: ${err.message}`);
