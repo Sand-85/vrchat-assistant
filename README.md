@@ -30,7 +30,7 @@
 **前置条件**：Node.js ≥ 22、一个 VRChat 账号（开启邮箱 OTP 或 TOTP 两步验证）。仅用邮箱 OTP 登录时才需要支持 IMAP 的邮箱（接收验证码）。
 
 1. 克隆仓库，复制 `credentials.example.json` 为 `credentials.json`，填入 VRChat 账号；认证二选一——邮箱 OTP 登录填邮箱 IMAP 授权码，或配置 `totp_secret` 走 TOTP 自动登录
-2. 安装依赖：仓库根执行 `npm install`；再执行 `npm run install-plugins`（或逐插件 `npm ci --prefix plugins/official/<name>`）——带第三方依赖的插件需此步，否则该插件不会加载
+2. 安装依赖：仓库根执行 `npm install`；再执行 `npm run install-plugins`（或逐插件 `npm ci --prefix plugins/official/<name>`）——带第三方依赖的插件需此步，否则该插件不会加载。**该命令也会为带前端源码的插件构建产物**（当前为 web-dashboard 的新版 dashboard UI）；单独重建可执行 `npm run build:dashboard`（**重建后需重启服务生效**——产物在插件加载时读入）。前端产物不入库（issue #186），缺失时服务回退旧版 UI 并在日志/`/health` 告警；**离线/内网环境**：npm 依赖不可达时前端构建会跳过（只告警不阻断）——可在有网机器执行 `npm run build:dashboard`，再把生成的 `plugins/official/web-dashboard/ui/dist/` 复制到目标机同一路径
 3. 启动服务：`node start-monitor.js`
 4. 验证：`curl http://127.0.0.1:8799/health` 返回 JSON 中 `auth.authenticated` 为 `true`、`ws.status` 为 `connected`
 
@@ -46,8 +46,8 @@
 | [skills/](./skills/) | 开箱即用的 Agent Skill 合集（含 MCP 工具清单、查询工作流、开发规范等，安装说明见 AGENTS.md） | 查询 / 调用工具 / 开发功能前 |
 | [DEVELOPMENT.md](./DEVELOPMENT.md) | 开发规范：跨平台约束、PR 要求、数据隐私、代码规范 | 修改代码 / 提交 PR |
 | [ARCHITECTURE.md](./ARCHITECTURE.md) | 系统架构：数据流、模块职责、插件化架构层次 | 理解代码结构 |
-| [docs/PLUGIN-API.md](./docs/PLUGIN-API.md) | 插件契约（v1.1）：插件与核心的唯一契约、6 面 API、安全与命名约束 | 编写插件前必读 |
-| [docs/PLUGIN-DEV.md](./docs/PLUGIN-DEV.md) | 插件开发指南：目录结构、register(api)、6 面 API 用法、核心服务消费 | 编写插件 / 扩展功能 |
+| [docs/PLUGIN-API.md](./docs/PLUGIN-API.md) | 插件契约（v1.3）：插件与核心的唯一契约、8 面 API、安全与命名约束 | 编写插件前必读 |
+| [docs/PLUGIN-DEV.md](./docs/PLUGIN-DEV.md) | 插件开发指南：目录结构、register(api)、8 面 API 用法、核心服务消费 | 编写插件 / 扩展功能 |
 | [docs/history/](./docs/history/INDEX.md) | 项目演进记录：里程碑时间线、每月发布/PR 与演进意义 | 新 Agent 上手先读 |
 | [service-windows/](./service-windows/README.md) | Windows 开机自启 + 崩溃自愈 + 每日修复报告（一键脚本） | Windows 常驻运行 |
 | [service-linux/](./service-linux/README.md) | Linux systemd 用户服务：开机自启 + 崩溃自愈 + journal 日志（一键脚本） | Linux 常驻运行 |

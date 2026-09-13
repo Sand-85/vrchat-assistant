@@ -1,9 +1,11 @@
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { logExtFailure, logExtFallback, logExtSuccess } from './ext-log.js';
 
 /**
- * Plugin API v1 — 为插件提供与核心交互的 6 个 API 表面。
+ * Plugin API v1 — 为插件提供与核心交互的 API 表面（**清单与语义以 `docs/PLUGIN-API.md` §4 为权威**，
+ * 此处不写死数量，避免与文档的双轨计数）。
  *
  * buildPluginApi(pluginName, { registry, ctx, services, serviceOwners, log })
  */
@@ -58,6 +60,26 @@ export function buildPluginApi(pluginName, { registry, ctx, services, serviceOwn
     vrchat: buildVrchatApi({ ctx, log: apiLog }),
 
     log: apiLog,
+
+    // 外部服务调用留痕（单一来源 core/ext-log.js）：插件禁止 import core/，故经此暴露。
+    // 插件抓取外部站点（PlanetVRC / BOOTH / Google Calendar 等）时必须逐分支调用：
+    //   失败/超时 → extLog.failure（WARN + ops_log）；降级/兜底/缓存命中/跳过 → extLog.fallback（INFO + ops_log）；
+    //   成功 → extLog.success（默认 debug，>2000ms 自动升 INFO）。一次触发恰好一行，禁静默降级。
+    extLog: {
+      failure(service, op, err, opts) { return logExtFailure(service, op, err, opts); },
+      fallback(service, op, reason) { return logExtFallback(service, op, reason); },
+      success(service, op, opts) { return logExtSuccess(service, op, opts); },
+    },
+
+    // 运行态上报扩展点（issue #186）：插件把需要运维可见的状态并入 /health。
+    // 用法：api.health({ dashboardUi: { state: 'built' } }) → /health.extras.<pluginName>.dashboardUi。
+    // 键空间按插件名隔离（review #187 ⚠️2）：插件无法覆盖核心字段（auth/plugins/ws 等，
+    // 避免误报认证状态——issue #59 专项语义）；卸载时由 loader 清理（review #187 ⚠️3）。
+    health(obj) {
+      if (!obj || typeof obj !== 'object') return;
+      if (!ctx.healthExtras) ctx.healthExtras = {};
+      ctx.healthExtras[pluginName] = { ...(ctx.healthExtras[pluginName] || {}), ...obj };
+    },
 
     // HTTP 路由注册：插件可挂载自定义路由（/mcp、/health 之外的路径）。
     // 核心 http-server 统一分发，路由随插件卸载自动清理。
