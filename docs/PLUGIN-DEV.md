@@ -70,9 +70,9 @@ export default function register(api) {
 
 ---
 
-## 4. 7 面 API 用法示例
+## 4. 8 面 API 用法示例
 
-契约 v1.3 共 7 个 API 表面。以下是每个的用法，示例摘自真实官方插件。
+契约 v1.3 共 8 个 API 表面。以下是每个的用法，示例摘自真实官方插件。
 
 ### 4.1 api.registerTool(def) — 注册一个 MCP 工具
 
@@ -198,6 +198,21 @@ if (cached) {
 - 文案由核心拼装（`服务 操作 失败: 原因（耗时 Xms）`），你只给 `service` / `op` / `err` / `reason`；错误信息会被压成单行并截断。**禁止把凭据（IMAP 授权码 / cookie）写进 `op`/`reason`。**
 - 明细检索 `get_ops_log(kind='ext')`；聚合快照见 `GET /health` 的 `api.ext`。
 - 完整语义与旧核心兼容写法（`api.extLog?.failure?.(...)`）见 [PLUGIN-API.md §4.7](./PLUGIN-API.md)。
+
+### 4.8 api.health(obj) — 运行态上报（并入 /health）
+
+把插件自身的运行态（就绪 / 降级 / 缺失等）暴露给运维与 Agent 诊断，无需自建端点：
+
+```js
+// plugins/official/web-dashboard/index.js 真实写法
+api.health({ dashboardUi: { state: hasDist ? "built" : "missing" } });
+// → GET /health 的 extras.web-dashboard.dashboardUi
+```
+
+- 上报内容按**插件名**收纳在 `/health` 的 `extras` 段，**不参与核心字段命名空间**（无法覆盖 `auth`/`plugins`/`ws` 等）；
+- **卸载 / 热重载 / 加载或重载失败回滚**时 loader 自动清除该插件的 `extras` 键，无需在 `dispose()` 里手工清理；
+- 旧核心能力探测：`typeof api.health === 'function'` 后再调用，否则插件加载会因 `api.health is not a function` 失败。
+- 完整语义见 [PLUGIN-API.md §4.8](./PLUGIN-API.md)。
 
 ---
 
