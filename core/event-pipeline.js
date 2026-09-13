@@ -312,7 +312,9 @@ export class EventPipeline {
         lastSeen: event.receivedAt,
       });
     }
-    // diff 之后回写权威资料（只补非空字段，幂等；顺序关键——先 diff 再写，否则基线被覆盖丢变更）
+    // diff 之后回写权威资料（只补非空字段，幂等；顺序关键——先 diff 再写，否则基线被覆盖丢变更）。
+    // 注：上方 L297 已写过同批字段，此处为防御性补漏——若将来主写入路径收窄/字段缺项，
+    // 非空字段仍会被补齐（无 user 对象时跳过，不影响既有值）。
     this._syncProfileFromEvent(userId, userObj);
 
     this._storeEvent(event);
@@ -325,7 +327,10 @@ export class EventPipeline {
    * 事件、不落库（当 user 对象缺失时）。事件里的 user 对象是权威当前快照，必须落库。
    */
   _syncProfileFromEvent(userId, userObj) {
-    if (!userObj || typeof userObj !== 'object') return;
+    if (!userObj || typeof userObj !== 'object') {
+      log.debug(`[资料回写] 跳过（事件无 user 对象）: ${userId}`);
+      return;
+    }
     const patch = { userId };
     const put = (key, val) => { if (val !== undefined && val !== null && val !== '') patch[key] = val; };
     put('displayName', userObj.displayName);
@@ -336,7 +341,14 @@ export class EventPipeline {
     put('userIcon', userObj.userIcon);
     put('pronouns', userObj.pronouns);
     if (Object.keys(patch).length > 1) {
-      try { this.storage.upsertFriend(patch); } catch { /* 资料回写失败不影响主流程 */ }
+      try {
+        this.storage.upsertFriend(patch);
+        const fields = Object.keys(patch).filter((k) => k !== 'userId').join('/');
+        log.debug(`[资料回写] ${String(patch.displayName || userId)}: ${fields}`);
+      } catch (e) {
+        // 降级路径留痕：回写属增强，失败不阻断主流程但必须可见
+        log(`[资料回写] 失败（不影响主流程）: ${userId} ${String((e && e.message) || e)}`);
+      }
     }
   }
 

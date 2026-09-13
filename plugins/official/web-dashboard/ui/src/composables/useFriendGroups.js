@@ -65,7 +65,7 @@ export function useFriendGroups() {
     const gs = [...m.entries()].map(([wid, l]) => {
       const named = l[0].worldName && l[0].worldName !== wid;
       // 无名世界：用地点语义区分（private=私密实例 / local / none=未公开位置），避免多个同名分组
-      const fallback = wid === 'private' ? '私密实例' : (wid && wid !== 'none' ? '未公开位置' : '未公开位置');
+      const fallback = wid === 'private' ? '私密实例' : '未公开位置';
       return {
         label: named ? l[0].worldName : fallback,
         list: l,
