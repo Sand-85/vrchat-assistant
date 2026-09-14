@@ -855,7 +855,6 @@ export function registerDashboardServices(loader, ctx) {
     } catch { return { events: [], hasNext: false, totalCount: null }; }
   });
   loader.serviceOwners.set('dashboard.calendar', 'core');
-
   // 群组帖子（/groups/{gid}/posts：群组通知/公告类帖子流；2026-09-10 探测验证可用）
   loader.services.set('dashboard.groupPosts', async ({ groupId, n = 20, offset = 0 } = {}) => {
     if (typeof groupId !== 'string' || !groupId.startsWith('grp_')) throw new Error('groupId 必须是 grp_ 开头的群组 ID');
@@ -1335,7 +1334,7 @@ export function registerDashboardServices(loader, ctx) {
       mutualFriendCount: mutualFriends.length,
       mutualFriends: mutualFriends.map((f) => ({ id: f.id, displayName: f.displayName || '', avatarUrl: avatarOf(f.userIcon, f.currentAvatarImageUrl || f.currentAvatarThumbnailImageUrl) })),
       mutualGroupCount: mutualGroups.length,
-      mutualGroups: mutualGroups.map((g) => ({ id: g.id, name: g.name || '', memberCount: g.memberCount ?? null })),
+      mutualGroups: mutualGroups.map(pickGroup),
       groups: groupArr.map(pickGroup),
       favoriteWorlds,
       worlds: Array.isArray(worlds) ? worlds.map(pickWorld) : [],
