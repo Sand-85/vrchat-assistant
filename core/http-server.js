@@ -296,7 +296,16 @@ export function createServer() {
     } catch (err) {
       log(` Unhandled: ${err.message}`);
       if (!res.headersSent) {
-        try { res.writeHead(502); res.end(err.message); } catch {}
+        // 安全（CodeQL #21 js/xss-through-exception）：异常文本可能含请求派生的片段，
+        // 而原 writeHead(502) 未声明 Content-Type → 浏览器会按内容嗅探成 HTML 渲染。
+        // 故不再回显异常文本：固定文案 + 显式 text/plain + nosniff；细节仍进日志（留痕不静默）。
+        try {
+          res.writeHead(502, {
+            'Content-Type': 'text/plain; charset=utf-8',
+            'X-Content-Type-Options': 'nosniff',
+          });
+          res.end('Bad Gateway：内部错误（详见服务日志）');
+        } catch {}
       }
     }
   });
