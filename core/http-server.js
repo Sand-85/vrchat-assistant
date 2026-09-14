@@ -69,6 +69,10 @@ function getOrCreateSession(sessionId) {
 }
 
 // ── SSE 响应辅助 ──
+// 安全：凡可能携带动态文本（异常信息 / 请求派生片段 / 工具输出）的响应一律显式禁用内容嗅探——
+// 响应缺 Content-Type 或仅靠嗅探时，浏览器可能把文本按 HTML 渲染（CodeQL #21 js/xss-through-exception 同族）。
+const NOSNIFF = { 'X-Content-Type-Options': 'nosniff' };
+
 export function sendSSE(res, events, sessionId) {
   if (res.headersSent) return;
   let body = '';
@@ -79,6 +83,7 @@ export function sendSSE(res, events, sessionId) {
     'Content-Type': 'text/event-stream',
     'Cache-Control': 'no-cache',
     'Content-Length': Buffer.byteLength(body),
+    ...NOSNIFF,
   };
   if (sessionId) headers['Mcp-Session-Id'] = sessionId;
   res.writeHead(200, headers);
@@ -126,6 +131,7 @@ async function handleRequest(req, res) {
       'Content-Type': 'application/json',
       'Content-Length': Buffer.byteLength(errBody),
       'WWW-Authenticate': 'Bearer error="invalid_token"',
+      ...NOSNIFF,
     });
     res.end(errBody);
     return;
@@ -138,6 +144,7 @@ async function handleRequest(req, res) {
         'Content-Type': 'application/json',
         'Content-Length': Buffer.byteLength(errBody),
         'WWW-Authenticate': 'Bearer error="invalid_token"',
+        ...NOSNIFF,
       });
       res.end(errBody);
       return;
@@ -154,7 +161,7 @@ async function handleRequest(req, res) {
       logApp.error(`插件 HTTP 路由失败 [${route.pluginName} ${pathname}]: ${err.message}`, { stack: err.stack, pathname, pluginName: route.pluginName });
       if (!res.headersSent) {
         const body = JSON.stringify({ error: 'Internal Server Error', message: err.message });
-        res.writeHead(500, { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) });
+        res.writeHead(500, { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body), ...NOSNIFF });
         res.end(body);
       }
     }
@@ -165,7 +172,7 @@ async function handleRequest(req, res) {
   if (req.method === 'GET' && pathname === '/health') {
     const status = buildHealthStatus({ ctx, storage, rateLimiter, wsManager, friendState, eventPipeline, serverState });
     const body = JSON.stringify(status, null, 2);
-    res.writeHead(200, { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) });
+    res.writeHead(200, { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body), ...NOSNIFF });
     res.end(body);
     return;
   }
@@ -176,7 +183,7 @@ async function handleRequest(req, res) {
   // 刷屏日志「GET stream disconnected, reconnecting in 1000ms...」（用户实测反馈）。
   // SDK 行为：405 会计入重连尝试（上限 2 次后停止）；200+立即结束则 attempt 归零 → 死循环。
   if (req.method === 'GET' && pathname === '/mcp') {
-    res.writeHead(405, { 'Allow': 'POST, DELETE', 'Content-Type': 'application/json' });
+    res.writeHead(405, { 'Allow': 'POST, DELETE', 'Content-Type': 'application/json', ...NOSNIFF });
     res.end(JSON.stringify({
       jsonrpc: '2.0',
       error: { code: -32000, message: 'This MCP server does not offer a server-initiated SSE stream; use POST for requests (DELETE to end the session).' },
@@ -193,7 +200,7 @@ async function handleRequest(req, res) {
   }
 
   if (req.method !== 'POST' || pathname !== '/mcp') {
-    res.writeHead(404);
+    res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8', ...NOSNIFF });
     res.end('Not Found');
     return;
   }
@@ -302,7 +309,7 @@ export function createServer() {
         try {
           res.writeHead(502, {
             'Content-Type': 'text/plain; charset=utf-8',
-            'X-Content-Type-Options': 'nosniff',
+            ...NOSNIFF,
           });
           res.end('Bad Gateway：内部错误（详见服务日志）');
         } catch {}
