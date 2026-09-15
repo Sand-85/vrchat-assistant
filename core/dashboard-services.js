@@ -10,6 +10,27 @@
  * 纯搬移重构：服务名、owner、实现逐字节一致，无行为变更。
  */
 import { isSafeModeEnabled } from './safe-mode.js';
+
+// 世界缓存新鲜度（2026-09-15 新增，env 可配）：world_cache 里的名字/描述/标签是**快照**，
+// 世界作者改名后不会自动变（实测 Idle Merchant 掛機商人 V0.1.4 → V0.3.1 停了 11 天）。
+// 超期即触发一次后台回源刷新（走 dashboard.world，内部限流 + 10s 超时）。
+const WORLD_CACHE_TTL_DAYS = Math.max(1, Number(process.env.VRC_MONITOR_WORLD_CACHE_TTL_DAYS) || 7);
+const WORLD_CACHE_TTL_MS = WORLD_CACHE_TTL_DAYS * 24 * 60 * 60 * 1000;
+// 回源失败冷却（2026-09-15 审查 💡1）：dashboard.world 失败时不写占位 → 若不做冷却，
+// 一个永久 404/不可见的世界会在每次 friends 请求里被反复回源（前端 120s 轮询 → 最坏每 ~2 分钟一次）。
+// 内存 Map 即可（重启即重置 → 重试一次，可接受）；无 schema 变更。
+const worldFetchCooldown = new Map(); // worldId -> lastAttemptAt
+
+// world_cache.updated_at 由 SQLite datetime('now') 写入（UTC、无时区后缀）→ 补 Z 再解析。
+// 注意（审查 💡2）：updated_at 是「行被写过」的时间，setWorldNote/setWorldFavorited 也会刷新它而
+// 不动 name——所以拿它当新鲜度阈值是**近似值**（会写备注/收藏的世界往往刚玩过、名字本就新，
+// 影响小），不要据它推断「名字必然新鲜」。
+function worldCacheStale(updatedAt) {
+  if (!updatedAt) return true;
+  const t = Date.parse(String(updatedAt).replace(' ', 'T') + (String(updatedAt).endsWith('Z') ? '' : 'Z'));
+  if (Number.isNaN(t)) return true;
+  return Date.now() - t >= WORLD_CACHE_TTL_MS;
+}
 import { imgProxy, avatarThumb, avatarOf, avatarFileId } from './img-util.js';
 import { handleGetFriendWorldStats } from './tools/events.js';
 
@@ -89,7 +110,7 @@ export function registerDashboardServices(loader, ctx) {
   }
   loader.services.set('dashboard.friends', ({ limit = 100 } = {}) => {
     const rows = ctx.storage.query(`SELECT f.user_id AS userId, f.display_name AS displayName, f.is_online AS isOnline,
-      f.location, f.world_id AS worldId, COALESCE(NULLIF(f.world_name,''), wc.name, '') AS worldName, wc.image_url AS worldImageUrl,
+      f.location, f.world_id AS worldId, COALESCE(NULLIF(wc.name,''), f.world_name, '') AS worldName, wc.image_url AS worldImageUrl, wc.updated_at AS worldCacheUpdatedAt,
       f.platform, f.status, f.status_description AS statusDescription, f.bio, f.pronouns,
       f.trust_level AS trustLevel, f.memo, f.avatar_image_url AS avatarUrl, f.user_icon AS userIcon,
       f.last_seen AS lastSeen, f.last_online AS lastOnline, f.last_offline AS lastOffline
@@ -99,10 +120,13 @@ export function registerDashboardServices(loader, ctx) {
     // 「最近一起玩」按历史同屏聚合（与在线状态无关），排序靠后的好友此前被前 100/200 截断
     // → 点开误判「非好友」，共同好友/群组/世界/模型信息丢失。
     { $limit: Math.min(Math.max(Number(limit) || 100, 1), 1000) });
-    // 后台预热：在线好友所在世界缺缓存时拉取填充 world_cache（限流+10s 超时，不阻塞响应；
-    // 填充后下次请求 worldName/worldImageUrl 即有值，右侧栏显示世界名+头图）
+    // 后台预热：在线好友所在世界**缺缓存**或**缓存过期**（超过 VRC_MONITOR_WORLD_CACHE_TTL_DAYS）
+    // 时拉取刷新 world_cache（限流+10s 超时，不阻塞响应；填充/刷新后下次请求 worldName 即为新值——
+    // 这是「世界改名后本服务能跟上」的关键路径，原先只处理缺名，导致有名字的旧缓存永不更新）
     try {
-      const missing = rows.filter((r) => r.isOnline && r.worldId && String(r.worldId).startsWith('wrld_') && !r.worldName);
+      const missing = rows.filter((r) => r.isOnline && r.worldId && String(r.worldId).startsWith('wrld_')
+        && (!r.worldName || worldCacheStale(r.worldCacheUpdatedAt))
+        && (!worldFetchCooldown.has(r.worldId) || Date.now() - worldFetchCooldown.get(r.worldId) >= WORLD_CACHE_TTL_MS));
       if (missing.length) {
         const worldSvc = loader.services.get('dashboard.world');
         (async () => {
@@ -120,7 +144,7 @@ export function registerDashboardServices(loader, ctx) {
     const since = new Date(Date.now() - Number(days || 7) * 86400000).toISOString();
     // 取全部 user-location（含离开/传送 world_id=''），用 location 切分会话：
     // 进入世界（wrld_xxx:instance）→ 开新段；离开/传送（traveling/offline/空）→ 结束当前段
-    const rows = ctx.storage.query(`SELECT e.world_id AS worldId, COALESCE(NULLIF(e.world_name,''), wc.name, '') AS worldName, e.created_at AS createdAt, e.content_json AS content
+    const rows = ctx.storage.query(`SELECT e.world_id AS worldId, COALESCE(NULLIF(wc.name,''), e.world_name, '') AS worldName, e.created_at AS createdAt, e.content_json AS content
       FROM events e LEFT JOIN world_cache wc ON wc.world_id = e.world_id
       WHERE e.type = 'user-location' AND e.created_at >= $since
       ORDER BY e.created_at ASC`, { $since: since });
@@ -228,7 +252,7 @@ export function registerDashboardServices(loader, ctx) {
     const where = conds.length ? 'WHERE ' + conds.join(' AND ') : '';
     const rows = ctx.storage.query(`SELECT e.*, f.display_name AS friendDisplayName,
       f.avatar_image_url AS avatarUrl, f.user_icon AS userIcon, f.trust_level AS trustLevel,
-      COALESCE(NULLIF(e.world_name,''), wc.name, '') AS world_name,
+      COALESCE(NULLIF(wc.name,''), e.world_name, '') AS world_name,
       wc.image_url AS world_image_url
       FROM events e LEFT JOIN friends f ON f.user_id = e.user_id
       LEFT JOIN world_cache wc ON wc.world_id = e.world_id
@@ -593,7 +617,7 @@ export function registerDashboardServices(loader, ctx) {
   loader.services.set('dashboard.recentWorlds', ({ limit = 12 } = {}) => {
     const l = Math.min(Math.max(Number(limit) || 12, 1), 60);
     const worlds = ctx.storage.query(`SELECT e.world_id AS worldId,
-        COALESCE(NULLIF(e.world_name,''), wc.name, '') AS worldName,
+        COALESCE(NULLIF(wc.name,''), e.world_name, '') AS worldName,
         wc.image_url AS imageUrl,
         wc.favorited AS favorited,
         MAX(wc.note) AS note,
@@ -1009,6 +1033,7 @@ export function registerDashboardServices(loader, ctx) {
           return pick(w);
         }
       } catch { /* 超时/失败返回 null，由调用方回退缓存或占位 */ }
+      worldFetchCooldown.set(worldId, Date.now());   // 失败冷却（💡1），避免每请求重试一个不可见世界
       return null;
     };
     const cached = ctx.storage.getWorldName(worldId);
