@@ -16,6 +16,10 @@ import { isSafeModeEnabled } from './safe-mode.js';
 // 超期即触发一次后台回源刷新（走 dashboard.world，内部限流 + 10s 超时）。
 const WORLD_CACHE_TTL_DAYS = Math.max(1, Number(process.env.VRC_MONITOR_WORLD_CACHE_TTL_DAYS) || 7);
 const WORLD_CACHE_TTL_MS = WORLD_CACHE_TTL_DAYS * 24 * 60 * 60 * 1000;
+// 失败冷却（审查 💡1）：与新鲜度阈值**解耦**——用 7 天 TTL 当冷却会让一次瞬时失败
+// （网络抖动/限流/超时）把展示名停在旧值最多 7 天（旧行为「每请求重试」顺带的自愈没了）。
+// 30 分钟足够压住「不可见世界每 ~2 分钟被重试」的配额浪费，又保留快速自愈。
+const WORLD_FETCH_COOLDOWN_MS = 30 * 60 * 1000;
 // 回源失败冷却（2026-09-15 审查 💡1）：dashboard.world 失败时不写占位 → 若不做冷却，
 // 一个永久 404/不可见的世界会在每次 friends 请求里被反复回源（前端 120s 轮询 → 最坏每 ~2 分钟一次）。
 // 内存 Map 即可（重启即重置 → 重试一次，可接受）；无 schema 变更。
@@ -126,7 +130,7 @@ export function registerDashboardServices(loader, ctx) {
     try {
       const missing = rows.filter((r) => r.isOnline && r.worldId && String(r.worldId).startsWith('wrld_')
         && (!r.worldName || worldCacheStale(r.worldCacheUpdatedAt))
-        && (!worldFetchCooldown.has(r.worldId) || Date.now() - worldFetchCooldown.get(r.worldId) >= WORLD_CACHE_TTL_MS));
+        && (!worldFetchCooldown.has(r.worldId) || Date.now() - worldFetchCooldown.get(r.worldId) >= WORLD_FETCH_COOLDOWN_MS));
       if (missing.length) {
         const worldSvc = loader.services.get('dashboard.world');
         (async () => {
