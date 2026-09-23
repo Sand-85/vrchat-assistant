@@ -32,7 +32,28 @@
 边界（如实声明）：
 
 - 两枚启动戳记都不存在时（例如把仓库拷到新机器后直接 `node start-monitor.js`，本 watchdog 从未拉起过它）**不使用启动宽限**，此时仍由"连续失败"闸兜底 —— 实测外部拉起 + init≈70s 为 0 次误杀，init > ~120s 时最坏被误杀一次。
-- 拉起后 25s 验证失败 ⇒ **清除两枚戳记**并保留失败计数，下一轮立即可重试（不留 300s 静默窗口）。
+- 拉起后 25s 验证失败时**先判进程是否真的消失**：进程已消失（拉起即崩溃）⇒ 清除两枚戳记 + 回拨失败计数，下一轮立即重试；**进程仍在**（大概率仍在 init —— 25s 对 init 50-70s+ 的部署是假阴性）⇒ **保留宽限**，交回 `GRACE_SECONDS` 兜底。
+- 服务侧日志目录变量 `VRC_MONITOR_LOGGER_DIR` 既可写在环境变量里，也可只写在仓库 `.env`（`start-monitor.js` 会无条件加载它）—— watchdog 两处都读。watchdog 自己的 `VRC_MONITOR_LOG_DIR` 则**必须**在环境变量里（计划任务看不到 `.env`）。
+
+### 修复日志格式
+
+`service-logs/vrcmon-repairs.log` 每行以日期开头，`vrcmon_daily_report.py` 按日期前缀计数：
+
+```
+2026-09-23 16:55:28 repair                                    # 拉起后 25s 验证健康
+2026-09-23 17:12:03 repair (unverified: not healthy after 25s, 进程仍在)      # 仍在 init
+2026-09-23 17:12:03 repair (unverified: not healthy after 25s, 进程已消失)    # 拉起即崩溃
+```
+
+后两种也计入每日报告 —— 否则"每分钟重启但始终没起来"会被统计成"昨天 0 次修复"。
+
+### 自测
+
+```bash
+python service-windows/tests/test_vrcmon_watchdog.py   # 判据单测 + 长 init 时间线回归（打桩，无副作用）
+```
+
+CI 也会跑（见 `.github/workflows/ci.yml`）。**非 Windows 部署**（Linux / docker / systemd）不使用本 watchdog，但主服务同样会写 `logs/.vrcmon-service-start`（每次启动覆盖，仅作启动时刻标记）——看到该文件属正常，可安全忽略。
 
 ## 快速开始（Windows）
 

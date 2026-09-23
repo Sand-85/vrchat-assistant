@@ -754,7 +754,11 @@ async function main() {
   //     进程启动即崩溃时戳记会留在磁盘上，由 watchdog 的验证失败分支清除（不留静默窗口）。
   try {
     writeFileSync(path.join(logState.dir, '.vrcmon-service-start'), new Date().toISOString());
-  } catch { /* 戳记写失败不影响启动 */ }
+  } catch (e) {
+    // 不阻断启动，但必须留痕：写失败会让 service-windows 的 watchdog 失去启动宽限，
+    // 而"宽限失效"只会在误杀时才显形、极难归因（仓库「禁静默降级、逐分支留痕」规范）。
+    log(`[警告] 启动戳记写入失败（watchdog 启动宽限将不生效）: ${e.message}`);
+  }
 
   // 1. 初始化数据库
   log('[初始化] 初始化数据库...');
