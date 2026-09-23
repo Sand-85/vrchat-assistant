@@ -1,12 +1,14 @@
 """vrc-monitor watchdog — 崩溃自动修复（建议由计划任务每分钟运行一次）。
 
 行为：
-  - 服务健康（http://127.0.0.1:8799/health 返回 200）→ 静默退出（不输出、不通知）。
-  - 服务不健康但**端口尚未监听且刚拉起过（< GRACE_SECONDS=300s）**→ 认为仍在启动中，
+  - 服务健康（http://127.0.0.1:8799/health 返回 200）→ 清零连续失败计数，静默退出。
+  - 服务不健康但**端口尚未监听或刚拉起过（< GRACE_SECONDS=300s）**→ 认为仍在启动中，
     静默退出不做任何动作（大库 storage.init 实测可达 70s+，此前 4s 超时会误判为宕机，
     导致「杀掉正在启动的进程 → 重新拉起 → 又超时 → 再杀」的每分钟重启风暴，
     每次重启还会触发一次全量 DB 备份）。
-  - 服务不健康 → 杀掉 :8799 残留监听进程（仅 Windows）→ 以独立进程重新启动 →
+  - 服务不健康但**只是偶发一次**（连续失败未达 FAIL_THRESHOLD=2，窗口 FAIL_WINDOW=600s）
+    → 静默退出。事件循环被小时级任务阻塞时 /health 会短暂超时，单次超时不足以判定宕机。
+  - 连续若干次不健康 → 杀掉 :8799 残留监听进程（仅 Windows）→ 以独立进程重新启动 →
     等待 25 秒验证 → 成功则在修复日志追加一行；失败写入 watchdog 日志。
   - 全程无 stdout 输出（接入通知系统时：空输出 = 静默，可零成本轮询）。
 
@@ -27,6 +29,9 @@ HEALTH_URL = "http://127.0.0.1:8799/health"
 HEALTH_TIMEOUT = 8       # 健康检查超时（秒）：4s 在磁盘忙时太紧，容易误判
 GRACE_SECONDS = 300      # 启动宽限期：端口尚未监听 + 刚拉起过 → 视为启动中，不动它
 STAMP_NAME = ".vrcmon-watchdog-launch"   # 上次由本 watchdog 拉起服务的时刻戳
+FAIL_NAME = ".vrcmon-watchdog-unhealthy" # 连续不健康计数（内容 "count epoch"）
+FAIL_THRESHOLD = 2       # 连续探测失败达到该次数才判定宕机
+FAIL_WINDOW = 600        # 两次失败间隔超过该秒数则重新计数（秒）
 
 
 def project_dir():
@@ -73,6 +78,42 @@ def touch_stamp():
         with open(stamp_path(), "w", encoding="utf-8") as f:
             f.write(datetime.datetime.now().isoformat())
     except Exception:
+        pass
+
+
+def fail_path():
+    return os.path.join(log_dir(), FAIL_NAME)
+
+
+def read_fail():
+    """返回 (连续失败次数, 上次失败时刻)。"""
+    try:
+        with open(fail_path(), encoding="utf-8") as f:
+            count, ts = f.read().split()
+        return int(count), float(ts)
+    except Exception:
+        return 0, 0.0
+
+
+def bump_fail():
+    """记录一次探测失败并返回累计次数；距上次失败超过 FAIL_WINDOW 则重新计数。"""
+    count, last = read_fail()
+    if time.time() - last > FAIL_WINDOW:
+        count = 0
+    count += 1
+    try:
+        os.makedirs(log_dir(), exist_ok=True)
+        with open(fail_path(), "w", encoding="utf-8") as f:
+            f.write(f"{count} {time.time()}")
+    except Exception:
+        pass
+    return count
+
+
+def clear_fail():
+    try:
+        os.remove(fail_path())
+    except OSError:
         pass
 
 
@@ -127,6 +168,7 @@ def _launch_detached():
 
 def main():
     if healthy():
+        clear_fail()    # 健康即清零：偶发的短时阻塞不会累积成误判
         return 0  # 一切正常，静默
 
     now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -138,6 +180,14 @@ def main():
     if age is not None and age < GRACE_SECONDS:
         return 0
 
+    # 连续失败判定：单次超时可能只是事件循环被小时级大任务阻塞（实测「追踪非好友刷新」
+    # 期间 /health 会 >8s 无响应），此时杀进程＝把正常服务打断并重启（每次还要重建
+    # 380MB 备份）。要求连续 FAIL_THRESHOLD 次探测失败（FAIL_WINDOW 内）才判定宕机。
+    count = bump_fail()
+    if count < FAIL_THRESHOLD:
+        return 0
+
+    clear_fail()
     pid = port_pid()
     if pid is not None:
         try:
