@@ -285,6 +285,20 @@ export async function load(quiet = false) {
   const silent = quiet || store.feedEvents.length > 0;
   if (!silent) store.feedLoading = true;
   try {
+    // 2026-09-22 首屏合并：公网反代下每个请求要付 1.4-3s 往返，第一波 4 个接口并为 1 次。
+    // bootstrap 不可用（旧后端 / 404 / 报错）时回退到逐个请求，行为与之前完全一致。
+    let o; let f; let parsed; let rng;
+    // 2026-09-22 #228 的失败判据在两条路径上都要成立 ⇒ 提到外层 let（bootstrap 成功即视为本轮成功）
+    let okAny = true; let feedOk = true;
+    const boot = await get('/api/dashboard/bootstrap?limit=50').catch(() => null);
+    if (boot && (boot.overview || boot.friends)) {
+      o = boot.overview;
+      f = boot.friends;
+      parsed = parseEvents({ events: boot.events || [], total: boot.total || 0 });
+      rng = boot.eventsRange;
+      // bootstrap 返回体缺 events = 关键请求等价失败（#228 语义：关键请求失败不得清横幅、不得用空值覆盖旧动态）
+      feedOk = Array.isArray(boot.events);
+    } else {
     const settled = await Promise.allSettled([
       get('/api/dashboard/overview'),
       get('/api/dashboard/friends?limit=1000'),  // issue #127：好友全量进 store，避免截断误判非好友
@@ -292,16 +306,22 @@ export async function load(quiet = false) {
       get('/api/dashboard/events-range'),
     ]);
     const val = (i) => (settled[i].status === 'fulfilled' ? settled[i].value : null);
-    // 2026-09-22 评审残留：allSettled **永不 reject** ⇒ 不能把"本轮全部结束"当成"本轮成功"
+    // 2026-09-22 评审 🔴：这里原为 const o/f/parsed/rng —— 块级 const 遮蔽了外层 let
+    // ⇒ 出块后 parsed 仍是 undefined ⇒ parsed.events 抛 TypeError 被外层 catch 吞掉
+    // ⇒ 回退模式下首屏全空（与正文声称的「行为与之前一致」不符）⇒ 改为只赋值、不声明
+    // 2026-09-22 评审残留（#228）：allSettled **永不 reject** ⇒ 不能把"本轮全部结束"当成"本轮成功"
     // 判据改为"至少一个 fulfilled"；全部失败时反而写 loadError（此前 load() 自身无失败上报路径）
-    const okAny = settled.some((x) => x.status === 'fulfilled');
-    // 2026-09-22 评审（阻断）：只判「有任一成功」不够 —— events 单点失败而 overview 成功时，
+    // 2026-09-22 评审（阻断 · #228）：只判「有任一成功」不够 —— events 单点失败而 overview 成功时，
     // 横幅被清 + 动态被写成空 ⇒ 仍是「把失败伪装成正常结论」。关键请求＝动态流（settled[2]）
-    const feedOk = settled[2].status === 'fulfilled';
-    const o = val(0);
-    const f = val(1);
-    const parsed = parseEvents(val(2));
-    const rng = val(3);
+    // ⚠️ 维护方合并说明：#237 引入 bootstrap 路径后，这两个判据必须在外层声明（否则 bootstrap 路径
+    //    走到下方公共代码时 feedOk 未定义 → 被外层 catch 吞掉 → 首屏静默空白）
+    okAny = settled.some((x) => x.status === 'fulfilled');
+    feedOk = settled[2].status === 'fulfilled';
+    o = val(0);
+    f = val(1);
+    parsed = parseEvents(val(2));
+    rng = val(3);
+    }
     if (rng && rng.min) store.eventsRange = { min: rng.min, max: rng.max || null };
     if (o) {
       store.overview = o;
