@@ -48,6 +48,7 @@ import { handleRecommendWorlds } from './core/tools/recommend-worlds.js';
 import { parseTotpSecret, generateTotp } from './core/totp.js';
 import { notifier } from './core/notifier.js';
 import { buildChannels } from './core/notify-channels.js';
+import { decideTrackedFail } from './core/tracked-fail-policy.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -313,6 +314,8 @@ async function _seedTrackedNonFriends() {
 
 let _trackedRefreshRunning = false;  // 手动/定时刷新并发闸（防重复 diff 事件）
 
+const dn0 = (u) => u.display_name || u.user_id;
+
 async function _refreshTrackedNonFriends() {
   const { api, rateLimiter, storage } = ctx;
   if (!api || !rateLimiter) return;
@@ -322,7 +325,23 @@ async function _refreshTrackedNonFriends() {
   for (const u of list) {
     try {
       const r = await rateLimiter.execute(() => api._request('GET', `/users/${encodeURIComponent(u.user_id)}`));
-      if (r.status !== 200 || !r.data || r.data.error) continue;
+      if (r.status !== 200 || !r.data || r.data.error) {
+        // 2026-09-23 issue #241（评审 ⚠️2 修正）：判定抽到 core/tracked-fail-policy.js 的纯函数 ✓
+        // 只把「明确 404」当永久失效 —— 429/5xx 等暂时性故障不累计，避免误杀有效条目（且不会自愈）✗
+        const d = decideTrackedFail({ failCount: u.fail_count, status: r.status, hasDataError: !!(r.data && r.data.error) });
+        try {
+          if (d.remove) {
+            storage.run(`UPDATE tracked_non_friends SET removed_at = $t, fail_count = $n WHERE user_id = $u`,
+              { $t: new Date().toISOString(), $n: d.next, $u: u.user_id });
+            log("[追踪] " + dn0(u) + " 连续 " + d.next + " 次" + d.reason + " => 判定为失效并移出刷新列表（数据保留、可手工恢复）");
+          } else {
+            storage.run(`UPDATE tracked_non_friends SET fail_count = $n WHERE user_id = $u`, { $n: d.next, $u: u.user_id });
+          }
+        } catch { /* 标记失败不影响刷新 */ }
+        continue;
+      }
+      // 成功 => 清零（曾有失败但恢复的条目）
+      if (u.fail_count) { try { storage.run(`UPDATE tracked_non_friends SET fail_count = 0 WHERE user_id = $u`, { $u: u.user_id }); } catch { /* 忽略 */ } }
       const userObj = r.data;
       const av = userObj.currentAvatarImageUrl || userObj.currentAvatarThumbnailImageUrl || userObj.userIcon || '';
       const dn = userObj.displayName || u.display_name || '';
