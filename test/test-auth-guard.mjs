@@ -93,6 +93,7 @@ console.log('\n── 3. 端到端测试: HTTP 鉴权中间件 ──');
   ctx.rateLimiter = new RateLimiter();
   ctx.serverState = { started: Date.now(), authUser: { id: 'usr_test', displayName: 'tester' }, needsOtp: false, needsTotp: false };
   ctx.paths = { PORT: 0, HOST: '127.0.0.1' };
+  ctx.httpRoutes = new Map();
 
   // 模拟 pluginLoader
   const services = new Map();
@@ -107,7 +108,14 @@ console.log('\n── 3. 端到端测试: HTTP 鉴权中间件 ──');
     hasService: (name) => services.has(name),
     registerTool: () => {},
     log: () => {},
+    // 模拟 api.http.registerRoute（web-dashboard 等插件注册 HTTP 路由用）
+    http: { registerRoute: (r) => ctx.httpRoutes.set(`${r.method} ${r.path}`, r) },
   };
+  // 模拟 web-dashboard 注册的根路径重定向（GET/HEAD / → 302 /dashboard）与面板页面路由
+  const rootRedirect = (_req, res) => { res.writeHead(302, { Location: '/dashboard' }); res.end(); };
+  mockApi.http.registerRoute({ method: 'GET', path: '/', handler: rootRedirect });
+  mockApi.http.registerRoute({ method: 'HEAD', path: '/', handler: rootRedirect });
+  mockApi.http.registerRoute({ method: 'GET', path: '/dashboard', handler: (_req, res) => { res.writeHead(200, { 'Content-Type': 'text/html' }); res.end('<html>dashboard</html>'); } });
   registerAuthGuard(mockApi);
 
   ctx.pluginLoader = {
@@ -125,7 +133,7 @@ console.log('\n── 3. 端到端测试: HTTP 鉴权中间件 ──');
       const req = http.request('http://127.0.0.1:' + port + path, options, (res) => {
         let data = '';
         res.on('data', (c) => data += c);
-        res.on('end', () => resolve({ status: res.statusCode, data }));
+        res.on('end', () => resolve({ status: res.statusCode, data, headers: res.headers }));
       });
       req.on('error', reject);
       if (options.body) req.write(options.body);
@@ -140,7 +148,10 @@ console.log('\n── 3. 端到端测试: HTTP 鉴权中间件 ──');
   let res = await request('/health');
   assert.equal(res.status, 200, '未配置 Token 时 /health 正常访问');
   res = await request('/mcp');
-  assert.equal(res.status, 200, '未配置 Token 时 /mcp 正常访问');
+  // GET /mcp 的方法契约是 405（不提供 server→client SSE 流，见 mcp-method-contract 测试）：
+  // 这里断言「未被 401 拦截」即证明鉴权未启用时服务完全放行——405 表示已通过鉴权并抵达方法契约层。
+  assert.equal(res.status, 405, '未配置 Token 时 /mcp 抵达方法契约层（405 而非 401）');
+  assert.match(String(res.headers.allow || ''), /POST/);
   ok('未配置 Token 时服务默认完全放行（向后兼容）');
 
   // 3.2 启用 Token
@@ -170,19 +181,82 @@ console.log('\n── 3. 端到端测试: HTTP 鉴权中间件 ──');
 
   // 3.2.4 正确 Token - X-API-Key Header
   res = await request('/mcp', { headers: { 'x-api-key': TEST_TOKEN } });
-  assert.equal(res.status, 200);
-  ok('携带正确 X-API-Key 成功访问 /mcp');
+  // 鉴权通过 → 抵达 GET /mcp 的方法契约（405，不提供 server→client SSE 流）
+  assert.equal(res.status, 405, '携带正确 X-API-Key 应通过鉴权（405 = 已抵达方法契约层）');
+  ok('携带正确 X-API-Key 成功通过鉴权访问 /mcp');
 
   // 3.2.5 正确 Token - Query Parameter
   res = await request('/health?token=' + TEST_TOKEN);
   assert.equal(res.status, 200);
   assert.equal(JSON.parse(res.data).ok, true);
   res = await request('/mcp?token=' + TEST_TOKEN);
-  assert.equal(res.status, 200);
-  ok('携带正确 URL Query ?token=... 成功访问 /mcp 与 /health');
+  assert.equal(res.status, 405, '携带正确 ?token= 应通过鉴权（405 = 已抵达方法契约层）');
+  ok('携带正确 URL Query ?token=... 成功通过鉴权访问 /mcp 与 /health');
+
+  // 3.2.7 根路径豁免（PR #150）：GET/HEAD / → 302 /dashboard（无 token 也不返回 401）
+  res = await request('/');
+  assert.equal(res.status, 302, '配置 Token 时 GET / 豁免放行（不返回 401）');
+  assert.equal(res.headers.location, '/dashboard', '302 重定向到 /dashboard');
+  res = await request('/', { method: 'HEAD' });
+  assert.equal(res.status, 302, 'HEAD / 同样豁免放行');
+  assert.equal(res.headers.location, '/dashboard', 'HEAD 302 重定向到 /dashboard');
+  res = await request('/dashboard');
+  assert.equal(res.status, 200, '/dashboard 页面豁免回归正常');
+  ok('根路径 GET/HEAD / 豁免 → 302 /dashboard，页面豁免回归正常');
 
   // 清理测试环境
   delete process.env.VRC_MONITOR_AUTH_TOKEN;
+  await new Promise((resolve) => server.close(resolve));
+}
+
+console.log('\n── 4. 鉴权 fail-closed：token 已配置但 http.authenticate 服务缺失 ──');
+{
+  async function request(path, options = {}) {
+    return new Promise((resolve, reject) => {
+      const req = http.request('http://127.0.0.1:' + port + path, options, (res) => {
+        let data = '';
+        res.on('data', (c) => data += c);
+        res.on('end', () => resolve({ status: res.statusCode, data, headers: res.headers }));
+      });
+      req.on('error', reject);
+      if (options.body) req.write(options.body);
+      req.end();
+    });
+  }
+
+  // 4.1 启动期阻断：token 已配置 + 无 http.authenticate → createServer 抛错拒绝启动
+  process.env.VRC_MONITOR_AUTH_TOKEN = 'failclosed_test_token';
+  ctx.pluginLoader = {
+    hasService: () => false,
+    consume: () => { throw new Error('service not found'); },
+    getStatus: () => [],
+  };
+  assert.throws(() => createServer(), /fail-closed/, 'token 配置但无 http.authenticate 服务时 createServer 应拒绝启动');
+  ok('启动期 fail-closed：createServer 抛出 fail-closed 错误');
+
+  // 4.2 运行期 fail-closed：服务器在无 token 时创建，随后 token 生效 → 全部请求 401
+  delete process.env.VRC_MONITOR_AUTH_TOKEN;
+  const server = createServer();
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const port = server.address().port;
+
+  process.env.VRC_MONITOR_AUTH_TOKEN = 'failclosed_test_token';
+  let res = await request('/health');
+  assert.equal(res.status, 401, 'token 生效后 /health 应 401');
+  assert.ok(res.data.includes('fail-closed'), `401 响应体应说明 fail-closed，实际: ${res.data}`);
+  res = await request('/mcp');
+  assert.equal(res.status, 401, 'token 生效后 /mcp 应 401');
+  res = await request('/health', { headers: { authorization: 'Bearer failclosed_test_token' } });
+  assert.equal(res.status, 401, '即使携带正确 token，无 http.authenticate 服务仍应 401');
+  ok('运行期 fail-closed：token 生效后全部请求 401（含携带正确 token）');
+
+  delete process.env.VRC_MONITOR_AUTH_TOKEN;
+  res = await request('/health');
+  assert.equal(res.status, 200, '移除 token 后恢复放行（无 token 开发场景 fail-open）');
+  ok('移除 token 后恢复放行');
+
+  // 清理测试环境
+  ctx.pluginLoader = null;
   await new Promise((resolve) => server.close(resolve));
 }
 

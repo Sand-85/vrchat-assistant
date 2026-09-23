@@ -14,6 +14,7 @@ export default function register(api) {
       if (g.shortCode !== undefined && g.shortCode !== null) item.shortCode = g.shortCode;
       if (g.memberCount !== undefined && g.memberCount !== null) item.memberCount = g.memberCount;
       if (g.isVerified !== undefined && g.isVerified !== null) item.isVerified = g.isVerified;
+      if (g.iconUrl !== undefined && g.iconUrl !== null) item.iconUrl = g.iconUrl;
       if (g.myRank !== undefined && g.myRank !== null) {
         item.myRank = typeof g.myRank === 'object' ? (g.myRank.id || null) : g.myRank;
       }
@@ -308,6 +309,39 @@ export default function register(api) {
       },
     },
     handler: async (args) => handleGetUserGroups(args),
+  });
+
+  /** 收到的群组邀请（/users/{id}/groups/invited；self-only——他人 403 隐私门槛，2026-09-10 实测） */
+  async function handleGetGroupInvites({ userId }) {
+    let targetId = userId;
+    if (!targetId) {
+      const me = await api.vrchat.fetch('/auth/user');
+      targetId = me?.id;
+    }
+    if (!targetId) throw new Error('Unable to determine target user id');
+    const data = await api.vrchat.fetch(`/users/${targetId}/groups/invited`);
+    const invites = (data || []).map((g) => ({
+      groupId: g.groupId || g.id || null,
+      name: g.name || '',
+      shortCode: g.shortCode || null,
+      memberCount: g.memberCount ?? null,
+      isVerified: g.isVerified ?? null,
+      iconUrl: g.iconUrl || null,
+      description: g.description ? String(g.description).slice(0, 200) : null,
+    }));
+    return { userId: targetId, total: invites.length, invites };
+  }
+
+  api.registerTool({
+    name: 'get_group_invites',
+    description: '[group] List pending group invites for an account. Self only (VRChat 403s other users\' invites). Includes name/memberCount/description.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        userId: { type: 'string', description: 'VRChat user id (usr_...); omit to use the authenticated account' },
+      },
+    },
+    handler: async (args) => handleGetGroupInvites(args),
   });
 
   api.registerTool({

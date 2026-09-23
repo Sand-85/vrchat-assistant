@@ -1,7 +1,7 @@
 export default function register(api) {
   api.registerTool({
     name: 'x_world_digest',
-    description: '[查询·X推荐] 聚合指定 X 博主近 1/3/7/15/30 天推荐的世界，按收藏数排序输出；收藏/浏览比 ≥ 1/5 的标注为 ⭐重点。可选 refresh=true 先抓取最新推文再查询。',
+    description: '[查询·X推荐] 聚合指定 X 博主近 1/3/7/15/30 天推荐的世界，按收藏数排序输出；收藏/浏览比 ≥ 1/5 的标注为 重点。可选 refresh=true 先抓取最新推文再查询。',
     inputSchema: {
       type: 'object',
       properties: {

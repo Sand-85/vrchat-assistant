@@ -16,9 +16,10 @@ import {
   statSync,
   watch,
 } from 'node:fs';
+import { createRequire } from 'node:module';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { buildPluginApi } from './plugin-api.js';
+import { buildPluginApi, rewritePluginTableNames } from './plugin-api.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -39,6 +40,126 @@ const FORBIDDEN_IMPORT_PATTERNS = [
   /import\(['"]\.\.?\/core\//,
   /import\(['"]start-monitor/,
 ];
+// 破坏性工具名前缀契约（docs/PLUGIN-API.md §7）：工具名匹配这些前缀的插件工具
+// 必须声明 destructive: true，否则拒绝加载（静态扫描校验）。
+export const DESTRUCTIVE_TOOL_NAME_PREFIXES = [
+  'remove_', 'delete_', 'leave_', 'decline_', 'hide_', 'unfavorite_', 'unfriend_',
+];
+
+/** 逐字符标记代码区/字符串/注释，用于跳过注释与字符串中的 registerTool 匹配（防误报） */
+function codeMask(code) {
+  const mask = new Array(code.length).fill('code');
+  let i = 0;
+  while (i < code.length) {
+    const ch = code[i];
+    if (ch === '/' && code[i + 1] === '/') {
+      mask[i] = mask[i + 1] = 'comment';
+      i += 2;
+      while (i < code.length && code[i] !== '\n') { mask[i] = 'comment'; i++; }
+      continue;
+    }
+    if (ch === '/' && code[i + 1] === '*') {
+      mask[i] = mask[i + 1] = 'comment';
+      i += 2;
+      while (i < code.length && !(code[i] === '*' && code[i + 1] === '/')) { mask[i] = 'comment'; i++; }
+      if (i < code.length) { mask[i] = mask[i + 1] = 'comment'; i += 2; }
+      continue;
+    }
+    if (ch === '"' || ch === "'" || ch === '`') {
+      mask[i] = 'string';
+      i++;
+      while (i < code.length) {
+        mask[i] = 'string';
+        if (code[i] === '\\') { mask[i + 1] = 'string'; i += 2; continue; }
+        if (code[i] === ch) { i++; break; }
+        i++;
+      }
+      continue;
+    }
+    i++;
+  }
+  return mask;
+}
+
+/** 提取代码中 fnName(...) 直接传对象字面量的调用参数（花括号配对，跳过字符串/注释） */
+function extractCallObjectArgs(code, fnName) {
+  const results = [];
+  const mask = codeMask(code);
+  const callRe = new RegExp(`\\b${fnName}\\s*\\(`, 'g');
+  let m;
+  while ((m = callRe.exec(code)) !== null) {
+    if (mask[m.index] !== 'code') continue; // 注释/字符串中的匹配不参与扫描
+    const openIdx = m.index + m[0].length;
+    const braceIdx = code.indexOf('{', openIdx);
+    if (braceIdx === -1) continue;
+    if (!/^\s*$/.test(code.slice(openIdx, braceIdx))) continue; // 参数不是直接的对象字面量
+    const endIdx = matchBrace(code, braceIdx);
+    if (endIdx === -1) continue;
+    results.push(code.slice(braceIdx + 1, endIdx)); // 不含外层花括号，顶层键即深度 0
+  }
+  return results;
+}
+
+/** 从 idx 处的 { 找到配对的 }（跳过字符串/模板串/注释），找不到返回 -1 */
+function matchBrace(code, idx) {
+  let depth = 0;
+  let i = idx;
+  let inString = null;
+  let lineComment = false;
+  let blockComment = false;
+  while (i < code.length) {
+    const ch = code[i];
+    const next = code[i + 1];
+    if (lineComment) {
+      if (ch === '\n') lineComment = false;
+      i++;
+      continue;
+    }
+    if (blockComment) {
+      if (ch === '*' && next === '/') { blockComment = false; i += 2; } else i++;
+      continue;
+    }
+    if (inString) {
+      if (ch === '\\') { i += 2; continue; }
+      if (ch === inString) inString = null;
+      i++;
+      continue;
+    }
+    if (ch === '/' && next === '/') { lineComment = true; i += 2; continue; }
+    if (ch === '/' && next === '*') { blockComment = true; i += 2; continue; }
+    if (ch === '"' || ch === "'" || ch === '`') { inString = ch; i++; continue; }
+    if (ch === '{') depth++;
+    else if (ch === '}') { depth--; if (depth === 0) return i; }
+    i++;
+  }
+  return -1;
+}
+
+/** 对象字面量文本（不含外层花括号）第一层的 key 值；取不到返回 null */
+function topLevelValue(defText, key) {
+  let depth = 0;
+  let inString = null;
+  for (let i = 0; i < defText.length; i++) {
+    const ch = defText[i];
+    if (inString) {
+      if (ch === '\\') { i++; continue; }
+      if (ch === inString) inString = null;
+      continue;
+    }
+    if (ch === '"' || ch === "'" || ch === '`') { inString = ch; continue; }
+    if (ch === '{') { depth++; continue; }
+    if (ch === '}') { depth--; continue; }
+    if (depth !== 0 || !defText.startsWith(key, i)) continue;
+    if (i > 0 && /[A-Za-z0-9_$]/.test(defText[i - 1])) continue;
+    if (/[A-Za-z0-9_$]/.test(defText[i + key.length] || '')) continue;
+    const rest = defText.slice(i + key.length);
+    const vm = /^\s*:\s*(['"])([^'"]*)\1/.exec(rest);
+    if (vm) return vm[2];
+    const wm = /^\s*:\s*([A-Za-z0-9_$]+)/.exec(rest);
+    if (wm) return wm[1];
+  }
+  return null;
+}
 
 export class PluginLoader {
   constructor({ registry, ctx, log, notifier }) {
@@ -144,6 +265,22 @@ export class PluginLoader {
       if (/process\.exit\(/.test(code)) {
         errors.push(`文件 ${path.basename(file)} 使用了 process.exit`);
       }
+
+      // 破坏性工具名前缀契约（docs/PLUGIN-API.md §7）：
+      // 工具名匹配破坏性前缀但未声明 destructive: true → 拒绝加载。
+      if (code.includes('registerTool')) {
+        for (const defText of extractCallObjectArgs(code, 'registerTool')) {
+          const toolName = topLevelValue(defText, 'name');
+          if (!toolName) continue;
+          const hit = DESTRUCTIVE_TOOL_NAME_PREFIXES.find(p => toolName.startsWith(p));
+          if (hit && topLevelValue(defText, 'destructive') !== 'true') {
+            errors.push(
+              `文件 ${path.basename(file)} 工具名 ${toolName} 匹配破坏性前缀 "${hit}"，` +
+              `但未声明 destructive: true`
+            );
+          }
+        }
+      }
     }
 
     return errors;
@@ -222,30 +359,38 @@ export class PluginLoader {
     return { order, cyclePlugins };
   }
 
-  /** 执行 schema.sql（支持裸表名自动重写为 plg_<name>_<tbl>） */
+  /** 执行 schema.sql（白名单校验 + 裸表名自动重写为 plg_<name>_<tbl>） */
   _applySchema(plugin) {
     const { ctx } = this;
     if (!plugin.schemaFile || !existsSync(plugin.schemaFile)) return;
-    let sql = readFileSync(plugin.schemaFile, 'utf-8');
-
-    // 拒绝访问其他插件的 plg_ 前缀
+    const sql = readFileSync(plugin.schemaFile, 'utf-8');
     const prefix = `plg_${plugin.name}_`;
-    const foreignRe = /\bplg_[a-zA-Z0-9_-]+_/g;
-    let m;
-    while ((m = foreignRe.exec(sql)) !== null) {
-      if (m[0] !== prefix) {
-        throw new Error(`schema.sql 中表前缀 ${m[0]} 不属于本插件 ${plugin.name}`);
+    const rewritten = rewritePluginTableNames(sql, plugin.name, prefix);
+    ctx.storage.exec(rewritten);
+  }
+
+  /** 检查插件 package.json 依赖是否已安装（不自动安装，缺依赖则抛出错误） */
+  _checkPluginDeps(plugin) {
+    if (!plugin.dir || !existsSync(plugin.dir)) return;
+    const pkgPath = path.join(plugin.dir, 'package.json');
+    if (!existsSync(pkgPath)) return;
+    let pkg;
+    try {
+      pkg = JSON.parse(readFileSync(pkgPath, 'utf-8'));
+    } catch {
+      return;
+    }
+    const deps = pkg.dependencies;
+    if (!deps || typeof deps !== 'object' || Object.keys(deps).length === 0) return;
+
+    const req = createRequire(pkgPath);
+    for (const dep of Object.keys(deps)) {
+      try {
+        req.resolve(dep);
+      } catch {
+        throw new Error(`插件 ${plugin.name} 缺少依赖 ${dep}，请在仓库根执行: npm ci --prefix plugins/official/${plugin.name}`);
       }
     }
-
-    // 把 CREATE TABLE / ALTER TABLE 后的裸表名重写为带前缀的表名
-    const tableRe = /((?:CREATE TABLE|ALTER TABLE)\s+(?:IF\s+NOT\s+EXISTS\s+)?)([a-zA-Z0-9_]+)/gi;
-    sql = sql.replace(tableRe, (match, pre, tableName) => {
-      if (tableName.startsWith('plg_')) return match;
-      return `${pre}${prefix}${tableName}`;
-    });
-
-    ctx.storage.exec(sql);
   }
 
   /** 加载单个插件 */
@@ -289,7 +434,19 @@ export class PluginLoader {
     plugin.error = error;
     plugin.loaded = false;
     this.registry.removePluginTools(plugin.name);
-    this.log(`❌ 插件加载失败 [${plugin.name}]: ${error}`);
+    // review #187 💡C：register 先上报/先注册后抛错时，不得让已禁用插件残留 /health 键与路由
+    if (this.ctx.healthExtras) delete this.ctx.healthExtras[plugin.name];
+    for (const [key, route] of this.ctx.httpRoutes?.entries() || []) {
+      if (route.pluginName === plugin.name) this.ctx.httpRoutes.delete(key);
+    }
+    // R4 💡①：同族最后一面——失败插件提供的服务也须释放，否则后续插件同名服务被「服务名冲突」拒绝
+    for (const [svc, owner] of this.serviceOwners.entries()) {
+      if (owner === plugin.name) {
+        this.services.delete(svc);
+        this.serviceOwners.delete(svc);
+      }
+    }
+    this.log(`[失败] 插件加载失败 [${plugin.name}]: ${error}`);
   }
 
   /** 加载所有插件 */
@@ -343,6 +500,7 @@ export class PluginLoader {
       const plugin = candidates.find(p => p.name === name);
       if (plugin.status === 'error') continue;
       try {
+        this._checkPluginDeps(plugin);
         this._applySchema(plugin);
         await this._loadPlugin(plugin);
         plugin.status = 'loaded';
@@ -366,6 +524,8 @@ export class PluginLoader {
     for (const [key, route] of this.ctx.httpRoutes?.entries() || []) {
       if (route.pluginName === name) this.ctx.httpRoutes.delete(key);
     }
+    // 运行态上报清理（review #187 ⚠️3）：插件卸载/重载后不得让 /health 残留其上报键
+    if (this.ctx.healthExtras) delete this.ctx.healthExtras[name];
     for (const [svc, owner] of this.serviceOwners.entries()) {
       if (owner === name) {
         this.services.delete(svc);
@@ -395,10 +555,15 @@ export class PluginLoader {
     if (plugin.dispose) {
       try { plugin.dispose(); } catch (err) { this.log(`插件 ${name} dispose 出错: ${err.message}`); }
     }
+    // R4 💡②：重载前快照旧版运行态（路由/上报），失败回滚时恢复——否则回滚后旧版虽在跑却丢了路由与 /health 上报
+    const oldRoutes = [...(this.ctx.httpRoutes?.entries() || [])].filter(([, r]) => r.pluginName === name);
+    const oldExtras = this.ctx.healthExtras ? this.ctx.healthExtras[name] : undefined;
     this.registry.removePluginTools(name);
     for (const [key, route] of this.ctx.httpRoutes?.entries() || []) {
       if (route.pluginName === name) this.ctx.httpRoutes.delete(key);
     }
+    // 运行态上报清理（review #187 ⚠️3）：插件卸载/重载后不得让 /health 残留其上报键
+    if (this.ctx.healthExtras) delete this.ctx.healthExtras[name];
     // 移除该插件提供的服务
     const oldServices = [];
     for (const [svc, owner] of this.serviceOwners.entries()) {
@@ -415,6 +580,17 @@ export class PluginLoader {
       plugin.error = null;
     } catch (err) {
       this.log(` 插件热重载失败 [${name}]: ${err.message}，回滚旧版`);
+      // review #187 💡C：回滚旧版时清掉失败新版本上报的 extras 与它可能注册的路由
+      if (this.ctx.healthExtras) delete this.ctx.healthExtras[name];
+      for (const [key, route] of this.ctx.httpRoutes?.entries() || []) {
+        if (route.pluginName === name) this.ctx.httpRoutes.delete(key);
+      }
+      // R4 💡②：恢复旧版的路由与 /health 上报（旧版 register 不会重跑，只能靠快照还原）
+      for (const [key, route] of oldRoutes) this.ctx.httpRoutes.set(key, route);
+      if (oldExtras !== undefined) {
+        if (!this.ctx.healthExtras) this.ctx.healthExtras = {};
+        this.ctx.healthExtras[name] = oldExtras;
+      }
       for (const t of oldTools) {
         this.registry.getPluginTools().push(t);
         this.registry.getPluginToolMap().set(t.name, t);
@@ -458,9 +634,10 @@ export class PluginLoader {
     try {
       this._loadManifest(candidate);
       if (this.plugins.has(candidate.name)) {
-        this.log(`⚠️ 插件 ${candidate.name} 已存在，跳过新插件加载`);
+        this.log(`[警告] 插件 ${candidate.name} 已存在，跳过新插件加载`);
         return;
       }
+      this._checkPluginDeps(candidate);
       this._applySchema(candidate);
       await this._loadPlugin(candidate);
       candidate.status = 'loaded';
@@ -469,7 +646,7 @@ export class PluginLoader {
       candidate.status = 'error';
       candidate.error = err.message;
       this.plugins.set(candidate.name, candidate);
-      this.log(`❌ 插件加载失败 [${candidate.name || candidate.dir}]: ${err.message}`);
+      this.log(`[失败] 插件加载失败 [${candidate.name || candidate.dir}]: ${err.message}`);
     }
   }
 
@@ -511,7 +688,7 @@ export class PluginLoader {
         });
         this.watchers.push(watcher);
       } catch (err) {
-        this.log(`️ 插件目录监听失败 ${dir}: ${err.message}`);
+        this.log(`[警告] 插件目录监听失败 ${dir}: ${err.message}`);
       }
     }
   }

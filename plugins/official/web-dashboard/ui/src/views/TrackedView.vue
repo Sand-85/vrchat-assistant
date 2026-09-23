@@ -1,7 +1,8 @@
 <script setup>
 import { ref, onMounted, computed } from 'vue';
 import { get, post } from '../api.js';
-import { time, date, dateTime, avatarLabel , reltime } from '../utils.js';
+import { time, date, dateTime, avatarLabel , reltime, statusLabels } from '../utils.js';
+import { statusColor } from '../composables/useFriendGroups.js';
 import { openUser } from '../store.js';
 import { toast } from '../toast.js';
 import { confirm } from '../confirm.js';
@@ -47,10 +48,12 @@ function isTracked(userId) {
   return (items.value || []).some((x) => x.userId === userId);
 }
 async function addTracked(user) {
-  if (addBusy.value || !user.userId) return;
+  // 搜索接口统一返回 id 字段（dashboard/search 各类型同形），兼容旧 userId 字段
+  const uid = user.id || user.userId;
+  if (addBusy.value || !uid) return;
   addBusy.value = true;
   try {
-    const r = await post('/api/dashboard/tracked', { userId: user.userId, displayName: user.name });
+    const r = await post('/api/dashboard/tracked', { userId: uid, displayName: user.name });
     if (r && r.error) throw new Error(r.error);
     toast(r.added ? `已添加追踪「${user.name}」，正在拉取资料…` : `「${user.name}」已在追踪列表中`, r.added ? 'success' : 'info');
     addOpen.value = false;
@@ -132,11 +135,10 @@ async function load() {
   }
 }
 
-// 排序：在线优先（active/joinme/askme/busy），其次有变化的，最后按最近刷新倒序
+// 排序：在线优先（按 location 判定在游戏中），其次有变化的，最后按最近刷新倒序
 function sortTracked(list) {
   const rank = (x) => {
-    const s = String(x.status || '').toLowerCase();
-    const online = ['active', 'join me', 'ask me', 'busy'].some((k) => s.includes(k.split(' ')[0]));
+    const online = isOnline(x.location);
     return (online ? 0 : 1) * 100 + (x.lastRefreshAt ? 0 : 1) * 10;
   };
   return [...list].sort((a, b) => rank(a) - rank(b) || String(b.lastRefreshAt || '').localeCompare(String(a.lastRefreshAt || '')));
@@ -153,6 +155,41 @@ const filtered = computed(() => {
 
 const trackedCount = computed(() => (items.value || []).length);
 
+// ── 备注编辑（tracked memo，≤200 字符；空串=清除）──
+const memoDialog = ref(false);
+const memoTarget = ref(null);      // { userId, displayName }
+const memoDraft = ref('');
+const memoSaving = ref(false);
+const memoOf = (x) => String(x && x.memo || '').trim();
+function openMemo(x) {
+  memoTarget.value = { userId: x.userId, displayName: x.displayName || x.userId };
+  memoDraft.value = memoOf(x);
+  memoDialog.value = true;
+}
+async function saveMemo() {
+  if (!memoTarget.value || memoSaving.value) return;
+  memoSaving.value = true;
+  try {
+    const r = await post('/api/dashboard/tracked/memo', { userId: memoTarget.value.userId, memo: memoDraft.value });
+    if (!r || r.ok !== true) throw new Error((r && r.error) || '保存失败');
+    const it = (items.value || []).find((x) => x.userId === memoTarget.value.userId);
+    if (it) it.memo = String(r.memo || '');
+    // review #173：updated:false = 行已被并发移除（权威兜底/手动移除），本地不误报成功文案
+    if (r.updated === false) {
+      toast('该用户已不在追踪列表，备注未生效', 'info');
+      memoDialog.value = false;
+    } else {
+      toast(memoOf(it) ? '备注已保存' : '备注已清除', 'success');
+      memoDialog.value = false;
+    }
+    memoDialog.value = false;
+  } catch (e) {
+    toast('备注保存失败：' + (e.message || e), 'error');
+  } finally {
+    memoSaving.value = false;
+  }
+}
+
 // 变化时间线类型筛选（全部/头像/简介/状态）
 const changeFilter = ref('all');
 const CHANGE_TYPES = [
@@ -160,6 +197,7 @@ const CHANGE_TYPES = [
   { v: 'avatar', l: '头像' },
   { v: 'bio', l: '简介' },
   { v: 'status', l: '状态' },
+  { v: 'location', l: '位置' },
 ];
 const filteredChanges = (userId) => {
   const cs = changesMap.value[userId] || [];
@@ -181,15 +219,19 @@ const lastChangeAt = (x) => {
   return x.lastChangeAt || '';
 };
 
-const CHANGE_LABEL = { bio: '简介变更', status: '状态变更', avatar: '头像更新', user_icon: '头像图标更新', pronouns: '代词更新', displayName: '改名' };
-const statusText = (s) => ({ active: '在线', 'join me': '加入我', 'ask me': '问我', busy: '忙碌', offline: '离线' }[s] || s || '—');
+const CHANGE_LABEL = { bio: '简介变更', status: '状态变更', avatar: '头像更新', user_icon: '头像图标更新', pronouns: '代词更新', trust_level: '等级变更', displayName: '改名', location: '位置/上下线' };
+// 位置可读化：offline=离线 / offline:offline=网页在线 / traveling=传送中 / wrld_xxx=世界（世界名在 c.worldName 里附加）
+const locLabel = (l) => { const v = String(l || ''); if (!v || v === 'offline') return '离线'; if (v === 'offline:offline') return '网页在线'; if (v === 'traveling') return '传送中'; return v; };
+const statusText = (s) => statusLabels[s] || s || '—';
 // 状态圆点颜色（对齐好友页视觉）：在线系绿色，离线灰色
-function statusDotStyle(s) {
-  const v = String(s || '').toLowerCase();
-  const online = ['active', 'join me', 'ask me', 'busy'].some((k) => v.includes(k.split(' ')[0]));
-  return { background: online ? '#52c41a' : v.includes('offline') ? 'var(--border-strong)' : 'var(--text-dim)' };
+function statusDotStyle(loc) {
+  return { background: isOnline(loc) ? '#52c41a' : 'var(--border-strong)' };
 }
-const isOnline = (s) => !['offline', ''].includes(String(s || ''));
+// 真实在线判定：只看 location（status 是用户偏好，离线保留）。offline=真离线、offline:offline=网页在线不在世界、traveling=转场，均不算在游戏中。
+const isOnline = (loc) => {
+  const v = String(loc || '').trim().toLowerCase();
+  return v !== '' && !['offline', 'offline:offline', 'traveling'].includes(v);
+};
 
 function toggle(userId) {
   if (expanded.value === userId) {
@@ -273,13 +315,14 @@ onMounted(load);
           <Avatar :image="x.avatarUrl || ''" :label="avatarLabel(x.avatarUrl, x.displayName)" shape="circle" size="large" />
           <div class="tk-info">
             <b class="tk-name">
-              <span v-if="x.status" class="tk-dot" :style="statusDotStyle(x.status)" :title="'当前状态：' + statusText(x.status)"></span>
+              <span v-if="x.status" class="tk-dot" :style="statusDotStyle(x.location)" :title="'当前状态：' + statusText(x.status)"></span>
               {{ x.displayName || x.userId }}
+              <Tag v-if="memoOf(x)" class="tk-memotag" :title="memoOf(x)">备注</Tag>
             </b>
             <small class="tk-sub">
               <span class="tk-statusline">
                 <span class="mono tk-uid">{{ x.userId }}</span>
-                <span v-if="x.status" class="tk-status" :class="{ on: isOnline(x.status) }">{{ statusText(x.status) }}</span>
+                <span v-if="x.status" class="tk-status" :class="{ on: isOnline(x.location) }">{{ statusText(x.status) }}</span>
               </span>
               <span v-if="lastChangeAt(x)" class="tk-stat">最近变化 {{ reltime(lastChangeAt(x)) }}</span>
               <span v-if="x.lastRefreshAt" class="tk-stat tk-stat-dim">上次检测 {{ fmtRefresh(x.lastRefreshAt) }}</span>
@@ -287,6 +330,9 @@ onMounted(load);
             </small>
           </div>
           <span v-if="lastChangeAt(x)" class="tk-dot" title="有资料变化"></span>
+          <Button size="small" text rounded icon="pi pi-pencil" :severity="memoOf(x) ? 'secondary' : 'contrast'"
+            :title="memoOf(x) ? '备注：' + memoOf(x) : '添加备注'" :aria-label="'编辑备注：' + (x.displayName || x.userId)"
+            @click.stop="openMemo(x)" />
           <Button size="small" text rounded :icon="expanded === x.userId ? 'pi pi-chevron-up' : 'pi pi-chevron-down'"
             :aria-label="expanded === x.userId ? '收起变化历史' : '展开变化历史'" @click.stop="toggle(x.userId)" />
         </button>
@@ -334,8 +380,20 @@ onMounted(load);
                     <span class="tc-new" :title="c.bio">新：{{ c.bio || '（已清空）' }}</span>
                   </template>
                   <template v-else-if="c.type === 'status'">
-                    <span class="tc-old">旧：{{ statusText(c.previousStatus) }}{{ c.previousStatusDescription ? ' · ' + c.previousStatusDescription : '' }}</span>
-                    <span class="tc-new">新：{{ statusText(c.status) }}{{ c.statusDescription ? ' · ' + c.statusDescription : '' }}</span>
+                    <!-- 对齐动态页状态灯样式：[旧灯]→[新灯] 新签名（种类未变时只显新灯；旧种类/旧签名在灯 title） -->
+                    <span class="tc-statusrow">
+                      <template v-if="c.previousStatus && c.previousStatus !== c.status">
+                        <span class="tc-slamp" :style="{ background: statusColor(c.previousStatus) }" :title="'旧：' + statusText(c.previousStatus) + (c.previousStatusDescription ? ' · ' + c.previousStatusDescription : '')"></span>
+                        <span class="tc-sarr">→</span>
+                      </template>
+                      <span class="tc-slamp" :style="{ background: statusColor(c.status) }" :title="'新：' + statusText(c.status)"></span>
+                      <span v-if="c.statusDescription" class="tc-sdesc" :title="c.statusDescription">{{ c.statusDescription }}</span>
+                      <span v-else-if="c.status" class="tc-sdesc dim">{{ statusText(c.status) }}</span>
+                    </span>
+                  </template>
+                  <template v-else-if="c.type === 'location'">
+                    <span class="tc-old">旧：{{ locLabel(c.previousLocation) }}</span>
+                    <span class="tc-new">新：{{ locLabel(c.location) }}{{ c.worldName ? '（' + c.worldName + '）' : '' }}</span>
                   </template>
                   <span v-else class="tc-new">{{ JSON.stringify(c).slice(0, 120) }}</span>
                 </div>
@@ -347,6 +405,15 @@ onMounted(load);
         </div>
       </div>
     </div>
+
+    <Dialog v-model:visible="memoDialog" modal :header="'备注：' + (memoTarget ? memoTarget.displayName : '')" :style="{ width: '420px', maxWidth: '92vw' }">
+      <Textarea v-model="memoDraft" rows="4" maxlength="200" autoResize class="w-full" placeholder="给这个非好友写点备注（≤200 字符，仅自己可见）" @keydown.enter.exact.prevent="saveMemo" />
+      <small class="tk-memohint">{{ memoDraft.length }}/200</small>
+      <template #footer>
+        <Button size="small" text label="取消" @click="memoDialog = false" />
+        <Button size="small" :label="memoOf({ memo: memoDraft }) ? '保存' : '清除备注'" icon="pi pi-check" :loading="memoSaving" @click="saveMemo" />
+      </template>
+    </Dialog>
 </template>
 
 <style scoped>
@@ -403,6 +470,14 @@ onMounted(load);
 .tc-date { font-size: 9px; color: var(--text-dim); }
 .tc-card { min-width: 0; flex: 1; background: var(--surface); border: 1px solid var(--border-soft); border-radius: 8px; padding: 7px 9px; }
 .tc-body { margin-top: 5px; display: flex; flex-direction: column; gap: 3px; }
+/* 状态变更行：对齐动态页（FeedView）状态灯视觉，横排 [旧灯]→[新灯] 签名 */
+.tc-statusrow { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.tc-slamp { width: 12px; height: 12px; border-radius: 50%; display: inline-block; flex: none; box-shadow: 0 0 0 2px color-mix(in srgb, currentColor 12%, transparent); border: 1.5px solid rgba(0,0,0,0.35); }
+.tc-sarr { color: var(--text-dim); font-size: 11px; flex: none; }
+.tc-sdesc { color: var(--text); font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.tc-sdesc.dim { color: var(--text-dim); font-weight: 400; }
+.tk-memotag { font-size: 10px; vertical-align: 2px; margin-left: 4px; }
+.tk-memohint { color: var(--text-dim); display: block; margin-top: 4px; }
 .tc-avatars { display: flex; align-items: center; gap: 8px; }
 .tc-avpair { display: flex; flex-direction: column; align-items: center; gap: 2px; }
 .tc-av { width: 42px; height: 42px; border-radius: 8px; object-fit: cover; }

@@ -81,7 +81,7 @@ export async function handleAcceptFriendRequest({ notificationId, confirm }) {
   const r = await api._request('PUT', `/auth/user/notifications/${notificationId}/accept`);
   if (r.status === 404) throw new Error('该好友请求不存在或已处理');
   if (r.status !== 200) throw new Error(`API error: ${r.status}`);
-  log(`✅ accept_friend_request: ${notificationId}`);
+  log(`[成功] accept_friend_request: ${notificationId}`);
   return { notificationId, accepted: true, ok: true };
 }
 
@@ -94,7 +94,7 @@ export async function handleDeclineFriendRequest({ notificationId, confirm }) {
   const { api } = ctx;
   const r = await api._request('PUT', `/auth/user/notifications/${notificationId}/hide`);
   if (r.status !== 200) throw new Error(`API error: ${r.status}`);
-  log(`✅ decline_friend_request: ${notificationId}`);
+  log(`[成功] decline_friend_request: ${notificationId}`);
   return { notificationId, declined: true, ok: true };
 }
 // ── MCP 自声明工具表 ──

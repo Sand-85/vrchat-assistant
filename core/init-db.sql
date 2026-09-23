@@ -22,6 +22,8 @@ CREATE INDEX IF NOT EXISTS idx_events_user_time ON events(user_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_events_world ON events(world_id);
 -- events(user_id, created_at, type)：加速按用户+时间+类型的复合查询（getLatestFriendLocations / findFriendPair*）
 CREATE INDEX IF NOT EXISTS idx_events_user_time_type ON events(user_id, created_at, type);
+-- events(type, created_at)：加速按类型+时间窗的全量聚合（get_friend_world_stats 等，#165 review 建议）
+CREATE INDEX IF NOT EXISTS idx_events_type_time ON events(type, created_at);
 
 -- 好友当前状态
 CREATE TABLE IF NOT EXISTS friends (
@@ -212,7 +214,10 @@ CREATE TABLE IF NOT EXISTS tracked_non_friends (
   status TEXT DEFAULT '',
   status_description TEXT DEFAULT '',
   location TEXT DEFAULT '',
-  removed_at TEXT DEFAULT ''
+  removed_at TEXT DEFAULT '',
+  memo TEXT DEFAULT '',
+  trust_level TEXT DEFAULT '',
+  fail_count INTEGER DEFAULT 0          -- 连续失败计数（issue #241）
 );
 
 -- 服务运维日志（认证/连接生命周期）：独立于 events（动态流语义），保留最近 500 条（写入即裁剪）

@@ -137,12 +137,23 @@ cur.execute("SELECT created_at, content_json FROM events WHERE user_id=? AND typ
 
 1. `get_friend_info(userId=XX)` → 好友状态/bio/lastLogin/当前 location（bio 常含羁绊名单，与共同好友交叉 = 介绍人线索）
 2. `get_mutual_friends(userId=XX)` → 共同好友（自动带本地昵称），重叠度 = 圈层接近度
-3. 逐日 `get_companions(自己 userId)` → 过滤目标 userId，累计同屏天数/matchCount/worlds
-4. 综合：同屏频率与近期趋势（升温/降温）、共同好友里的核心圈成员、时段重合度
+3. `get_mutual_groups(userId=XX)` → 共同群组（群名+成员数），重叠群组数 = 共同社交圈层；成员数大的偏公共社区、小的偏亲友圈
+4. 逐日 `get_companions(自己 userId)` → 过滤目标 userId，累计同屏天数/matchCount/worlds
+5. 综合：同屏频率与近期趋势（升温/降温）、共同好友里的核心圈成员、时段重合度
 
 - **实时情报**：`get_friend_info` 的 location 能看出 TA 此刻在谁房里
 - **群组画像辅助**：`get_user_groups` + 批量 `get_group_info` 拿描述 → 按群规模分层（大社区/亲友群/技术核心组）判断融入深度（群组域见 vrchat-group-queries）
 - 展示：好友信息卡片 + 共同好友表 + 同屏时间线表 + 关系小结
+
+### 10.1 "谁把我删了" / 好友解除记录（friend-delete）
+
+**触发**：用户问「谁删除我了 / XX 是不是把我删了 / 为什么好友少了」。
+
+1. `get_friend_removals()` → 列出全部 friend-delete（friend-removals 插件工具）：每条 userId/displayName（回填其最后使用名）/nickname/createdAt
+2. 按时间筛近期：`get_friend_removals({ days: N })`；怀疑单个人：`get_friend_removals({ userId })`
+3. 佐证/深挖（确认是谁 + 疏远原因）：对目标 `get_friend_info`（读其 bio/status，如"会清理长期黄灯好友"类自述）→ `get_companions(自己)` 过滤该人看最近同屏 → `get_friend_events` 查对方最后活跃时间，判断删除是"清理型"还是"冲突型"
+
+**口径提示**：friend-delete = 对方解除好友（VRChat WS 推送），非 `remove_friend`（自己删）。事件不带对方名字，显示名由插件回溯其历史事件回填；本服务未运行期间发生的删除无法补测。原始数据也可经 `get_recent_events(typeFilter="friend-delete")` 查（核心 SQL 层类型检索，2026-09-06 起可查全史）。
 
 ## 11. 社交写操作（boop / 上传 / 邀请 / 好友 / 开房）
 
@@ -179,6 +190,7 @@ cur.execute("SELECT created_at, content_json FROM events WHERE user_id=? AND typ
 - `send_friend_request {userId|displayName}`：加好友（精确匹配不区分大小写）
 - `remove_friend {userId|displayName}`：⚠️ 不可逆，必须 confirm: true，否则只返回预览。测试只走零副作用路径
 - `get_mutual_friends {userId}`：共同好友（自动带本地昵称）
+- `get_mutual_groups {userId}`：共同群组（社交破冰/找共同话题；self/好友/非好友均可用）
 
 ### 11.6 隐私位置场景（boop 目标定位）
 - **好友位置显示 `private` ≠ 不在线/不在你房间**：VRChat 隐私设置可让位置对好友隐藏，且该好友可能不出现在 `get_online_friends` 列表。定位流程：`search_users` 按 displayName 子串搜 → 确认 `isFriend: true` → `get_friend_info` 确认 `state: online` → 直接 boop

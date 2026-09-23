@@ -37,6 +37,10 @@ const GOOGLE_KEY_ENV = process.env.VRC_MONITOR_GCAL_CRED;
 const GOOGLE_CAL_VRCEVE = '0058cd78d2936be61ca77f27b894c73bfae9f1f2aa778a762f0c872e834ee621@group.calendar.google.com';
 const GOOGLE_CAL_KR = 'vrchatcalendarkr@gmail.com';
 
+// 外部留痕能力（core/ext-log.js 经 plugin-api 暴露为 api.extLog）：插件禁 import core/，
+// 故在此接线——register(api) 时注入。留痕点：Google Calendar 代理/直连失败、非 2xx。
+let extLog = null;
+
 // ── 代理解析：与核心 core/fetch-x-worlds.js resolveProxy 同源（读同一批 env，兼容仓库既有网络规范）──
 // 显式 VRC_MONITOR_HTTP_PROXY 优先，否则 HTTPS_PROXY/https_proxy/HTTP_PROXY/http_proxy 兜底。
 // 未配置代理 → 直连（中国大陆需代理才能访问 Google Calendar 时靠 env 注入，见 SKILL.md）。
@@ -80,12 +84,17 @@ function httpRequest(url, { headers = {}, method = 'GET', body = null, timeoutMs
 function tryFetchWithProxy(url, opts = {}) {
   const proxy = resolveProxy();
   const errors = [];
+  const startedAt = Date.now();
   return (async () => {
     if (proxy) {
       try {
         const agent = new HttpsProxyAgent(proxy);
         return await httpRequest(url, { ...opts, agent });
-      } catch (e) { errors.push(`代理(${proxy})失败: ${e.code || e.message}`); }
+      } catch (e) {
+        errors.push(`代理(${proxy})失败: ${e.code || e.message}`);
+        // 降级留痕：代理通道失败 → 回退直连（INFO + ops_log）
+        extLog?.fallback?.('GoogleCalendar', '代理通道抓取', `代理(${proxy})失败，回退直连：${e.code || e.message}`);
+      }
     }
     // 直连（无代理配置，或代理失败回退）
     try {
@@ -93,14 +102,22 @@ function tryFetchWithProxy(url, opts = {}) {
     } catch (e) { errors.push(`直连失败: ${e.code || e.message}`); }
     const err = new Error(errors.join('；'));
     err.code = 'FETCH_FAILED';
+    // 失败留痕：全部通道失败（WARN + ops_log）
+    extLog?.failure?.('GoogleCalendar', '抓取日历数据', err, { durationMs: Date.now() - startedAt });
     throw err;
   })();
 }
 
 async function httpGet(url, opts = {}) {
   // 统一入口：JSON 源自动 parse，HTML 源返回文本。
+  const startedAt = Date.now();
   const r = await tryFetchWithProxy(url, { timeoutMs: opts.timeoutMs || 20000 });
-  if (r.status < 200 || r.status >= 300) throw new Error(`HTTP ${r.status}: ${url}`);
+  if (r.status < 200 || r.status >= 300) {
+    const err = new Error(`HTTP ${r.status}: ${url}`);
+    extLog?.failure?.('GoogleCalendar', '抓取日历数据', err, { durationMs: Date.now() - startedAt });
+    throw err;
+  }
+  extLog?.success?.('GoogleCalendar', '抓取日历数据', { durationMs: Date.now() - startedAt });
   const ct = String(r.headers['content-type'] || '');
   try {
     return ct.includes('json') ? JSON.parse(r.body) : r.body;
@@ -110,6 +127,7 @@ async function httpGet(url, opts = {}) {
 }
 
 export default function register(api) {
+  extLog = api.extLog || null;   // 外部调用留痕接线（core/ext-log.js 经 plugin-api 暴露）
   // ── Google Calendar API key 来源（使用者的 Google API Key，非本服务凭据）──
   // 优先级：① 数据库 plg_events_config（api.db，用户经 set_* 工具录入）② 插件目录 config.json 兜底。
   // 每次调用实时读 DB，便于用户运行期录入后立即可用（无需重启/热重载）。
@@ -243,7 +261,7 @@ export default function register(api) {
   async function collectGoogleCalendar(calId, src, lang, minDate, maxDate) {
     const googleKey = getGoogleKey();
     if (!googleKey || googleKey.includes('...')) {
-      api.log(`⚠️ 未配置 Google Calendar API key（${src} 跳过）。请经 set_community_events_google_key 录入（存入数据库）或设 VRC_MONITOR_GCAL_CRED / config.json`);
+      api.log(`[警告] 未配置 Google Calendar API key（${src} 跳过）。请经 set_community_events_google_key 录入（存入数据库）或设 VRC_MONITOR_GCAL_CRED / config.json`);
       return [];
     }
     const items = [];
@@ -261,7 +279,7 @@ export default function register(api) {
         if (!pageToken) break;
       }
     } catch (e) {
-      api.log(`⚠️ ${src} Google Calendar API 失败: ${e.message}（仅该源跳过，其余源照常）`);
+      api.log(`[警告] ${src} Google Calendar API 失败: ${e.message}（仅该源跳过，其余源照常）`);
       return [];
     }
     const out = [];
@@ -682,7 +700,7 @@ export default function register(api) {
         const HAVE_GC_KEY = !!(getGoogleKey() && !String(getGoogleKey()).includes('...'));
         const GC_UNAVAILABLE_REASON = HAVE_GC_KEY ? '' : '未配置 Google Calendar API key（用 set_community_events_google_key 录入或设 VRC_MONITOR_GCAL_CRED）';
 
-        api.log(`🔍 采集活动 window=${opts.window} focus=${opts.focus} sources=${opts.sources.join(',')}`);
+        api.log(`[查询] 采集活动 window=${opts.window} focus=${opts.focus} sources=${opts.sources.join(',')}`);
 
         // 采集（限流友好：串行，逐源）。记录每源 ok/fail 供 sourceBreakdown 区分「源不可达」与「无活动」。
             let collected = [];
@@ -728,7 +746,7 @@ export default function register(api) {
     const needMine = dedup.filter(e => !e.group_id || !(e.member_count || e.group_members));
     needMine.sort((a, b) => (b.shortcode ? 1 : 0) - (a.shortcode ? 1 : 0));
     const toMine = needMine.slice(0, maxMine);
-    api.log(`🔗 待群组处理 ${needMine.length} 个（本次挖/补 ${toMine.length}，上限 ${maxMine}；短码优先）`);
+    api.log(`[链接] 待群组处理 ${needMine.length} 个（本次挖/补 ${toMine.length}，上限 ${maxMine}；短码优先）`);
     for (const e of toMine) {
       await mineGroup(e);
     }
@@ -736,7 +754,7 @@ export default function register(api) {
     // 侧面补充源：窥探已挖掘/采集到的群组公告（peekGroups=true 时启用，有副作用）
     if (opts.peekGroups) {
       const groupIds = dedup.map(e => e.group_id).filter(Boolean);
-      api.log(`👀 窥探 ${[...new Set(groupIds)].length} 个群组公告（副作用：加入→读→退出）`);
+      api.log(`[窥探] 窥探 ${[...new Set(groupIds)].length} 个群组公告（副作用：加入→读→退出）`);
       const annEvents = await collectFromGroupAnnouncements(groupIds);
       if (annEvents.length > 0) {
         // 与已采集合并（去重交给后续统一逻辑）
@@ -744,7 +762,7 @@ export default function register(api) {
         for (const a of annEvents) {
           if (!seenNames.has(normName(a.name))) { dedup.push(a); seenNames.add(normName(a.name)); }
         }
-        api.log(`📣 群组公告补充 ${annEvents.length} 条活动线索`);
+        api.log(`[公告] 群组公告补充 ${annEvents.length} 条活动线索`);
       }
     }
 
@@ -799,7 +817,7 @@ export default function register(api) {
       }
     }
 
-    api.log(`✅ 完成：采集 ${collected.length} → 去重 ${dedup.length} → 输出 ${events.length}`);
+    api.log(`[成功] 完成：采集 ${collected.length} → 去重 ${dedup.length} → 输出 ${events.length}`);
 
     // 返回结构化 JSON（供 Agent 翻译/渲染 PDF/进一步加工）
     const HAVE_GOOGLE_KEY = getGoogleKey() ? true : false;
@@ -886,7 +904,7 @@ export default function register(api) {
         `DELETE FROM store WHERE (end_iso != '' AND end_iso < $now) OR (end_iso = '' AND start_iso < $past)`,
         { $now: now, $past: past }
       );
-      api.log(`🗑️ 清理过期活动 ${r.changes} 条`);
+      api.log(`[删除] 清理过期活动 ${r.changes} 条`);
     } catch (e) {
       api.log(`清理过期活动失败: ${e.message}`);
     }
@@ -912,7 +930,7 @@ export default function register(api) {
       return;
     }
     // status === false 表示明确离线，直接重挖三个窗口并落库
-    api.log('🌙 每日活动刷新：玩家离线，开始重挖社区活动');
+    api.log('[夜间] 每日活动刷新：玩家离线，开始重挖社区活动');
     try {
       for (const window of ['week', 'month', 'tonight']) {
         await api.tools.call('fetch_community_events', { window, maxMine: 30 });
@@ -966,7 +984,7 @@ export default function register(api) {
     cfg.run('INSERT OR REPLACE INTO config (cfg_key, cfg_val, updated_at) VALUES ($k, $v, datetime(\'now\'))',
       { $k: 'google_calendar_api_key', $v: apiKey.trim() });
     const ok = getGoogleKey() ? true : false;
-    api.log(`ℹ️ 使用者 Google API Key 已${apiKey.trim() ? '更新' : '清除'}（config 表）`);
+    api.log(`[信息] 使用者 Google API Key 已${apiKey.trim() ? '更新' : '清除'}（config 表）`);
     return {
       stored: true,
       configured: ok,

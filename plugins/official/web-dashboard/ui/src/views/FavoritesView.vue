@@ -3,6 +3,7 @@ import { ref, computed, onMounted } from 'vue';
 import { store, openWorld, openUser, openPreview } from '../store.js';
 import { get, post } from '../api.js';
 import { toast } from '../toast.js';
+import { confirm } from '../confirm.js';
 
 const tab = ref('worlds');
 const worlds = ref(null);
@@ -44,7 +45,10 @@ async function load() {
     try {
       const g = await get('/api/dashboard/favorites?type=groups');
       groupsList = (g && Array.isArray(g.groups)) ? g.groups : [];
-    } catch { groupsList = []; }
+    } catch (err) {
+      // 2026-09-22 彻查：失败不写正常态（[]=「确实没有」✗）⇒ 保持旧值 + 如实报错 ✓
+      toast('收藏分组加载失败：' + ((err && err.message) || err), 'error');
+    }
     if (!worlds.value) {
       const w = await get('/api/dashboard/favorites?type=worlds&limit=200');
       worlds.value = (w && w.worlds) || [];
@@ -126,6 +130,8 @@ const visibleFriendGroups = computed(() => pickGroups(friendGroups.value, friend
 async function removeFav(type, id, displayName) {
   const key = type + ':' + id;
   if (removing.value.has(key)) return;
+  // #162：取消收藏=云端不可逆，UI 二次确认
+  if (!await confirm({ message: '确认取消收藏' + (displayName ? '「' + displayName + '」' : '该项') + '？不可恢复。', header: '取消收藏', acceptLabel: '取消收藏' })) return;
   removing.value.add(key);
   // 乐观更新：先移除，失败回滚
   const prev = type === 'world' ? worlds.value : type === 'avatar' ? avatars.value : friends.value;

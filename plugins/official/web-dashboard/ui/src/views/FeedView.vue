@@ -34,6 +34,7 @@ const filterOptions = [
   { value: 'status', label: '状态变动' },
   { value: 'avatar', label: '模型变动' },
   { value: 'bio', label: '简介变更' },
+  { value: 'trustLevel', label: '等级变动' },
 ];
 
 /* ── 日期范围筛选（VRCX 式日历范围选择：只选首尾，中间某天没数据也可选）── */
@@ -286,7 +287,7 @@ const feedRows = computed(() => {
 /* ── 自动加载 ── */
 const FEED_TARGET = 50;
 // 性能保护（无虚拟滚动）：移动端 DOM 行数上限收紧（中端机挂 400 个复杂行滚动掉帧），
-// 桌面 400。到上限后停补并隐藏"加载更多"，用户用筛选/日期缩小范围查看更早内容
+// 桌面 400。到上限后**只停止自动触底补拉**（静默保护 DOM）；手动"加载更多"按钮始终可用 ✓（2026-09-22 用户要求撤掉对用户可见的上限语义）
 const isMobileDev = () => (typeof window !== 'undefined' && window.innerWidth < 900);
 const feedHardCap = computed(() => (isMobileDev() ? 200 : 400));
 function hasFilter() {
@@ -431,8 +432,8 @@ onUnmounted(() => {
       <template v-for="x in feedRows" :key="x.__sep ? 'sep-' + x.__sep : rowId(x)">
       <div v-if="x.__sep" class="ev-daysep"><span>{{ x.__sep }}</span></div>
       <div v-else class="ev-row" :class="{ open: expanded === rowId(x) }" role="button" tabindex="0" @click="toggleRow(x)" @keydown.enter="toggleRow(x)">
-        <div v-if="!store.isMobile" class="c-time mono">{{ time(x.createdAt) }}<small>{{ date(x.createdAt) }}</small></div>
-        <div v-else class="c-time mono">{{ date(x.createdAt) }}</div>
+        <div v-if="!store.isMobile" class="c-time mono"><span class="ct-hm">{{ time(x.createdAt) }}</span><small>{{ date(x.createdAt) }}</small></div>
+        <div v-else class="c-time mono"><span class="ct-hm">{{ time(x.createdAt) }}</span><small>{{ date(x.createdAt) }}</small></div>
         <div class="c-type"><Tag :value="TYPE_LABELS[typeOf(x)]" :severity="TYPE_SEVERITIES[typeOf(x)]" rounded><i class="pi ctype-ico" :class="TYPE_ICONS[typeOf(x)] || 'pi-circle'"></i></Tag></div>
         <div class="c-player" @click.stop="playerOpen(x)" role="button" tabindex="0" @keydown.enter="playerOpen(x)">
           <Avatar :image="playerAvatarOf(x)" shape="circle" size="small" :label="avatarLabel(playerAvatarOf(x), playerNameOf(x))" />
@@ -463,6 +464,11 @@ onUnmounted(() => {
             <span v-if="x.instanceType || x.region || x.instanceId" class="inst mono">{{ instanceLabel(x.instanceType) }}{{ x.region ? ' · ' + x.region.toUpperCase() : '' }}{{ x.instanceId ? ' · ' + x.instanceId : '' }}</span>
             <span v-if="x.travelingToLocation" class="dim">传送中</span>
             </template>
+          </template>
+
+          <!-- 网页端/App 在线切换（friend-active）：显示转网页端在线/转App在线（#181 连带，summary 由后端语义化） -->
+          <template v-else-if="typeOf(x) === 'status' && x.type === 'friend-active'">
+            <span class="sdesc"><i class="pi pi-globe" style="font-size:11px;margin-right:4px"></i>{{ x.summary }}</span>
           </template>
 
           <!-- 状态变动：旧状态灯 → 新状态灯 / [灯] 当前签名 -->
@@ -551,6 +557,11 @@ onUnmounted(() => {
           <!-- 代词变更 -->
           <template v-else-if="typeOf(x) === 'pronouns'">
             <span class="dim">代词：</span><span>{{ x.previousPronouns || '(空)' }} → {{ x.pronouns || '(空)' }}</span>
+          </template>
+
+          <!-- 信任等级变更 -->
+          <template v-else-if="typeOf(x) === 'trustLevel'">
+            <span class="dim">信任等级：</span><span>{{ x.previousTrustLevel || '(空)' }} → {{ x.trustLevel || '(空)' }}</span>
           </template>
 
           <!-- 改名 -->
@@ -674,7 +685,13 @@ onUnmounted(() => {
       </template>
 
       <div class="feed-more">
-        <Button v-if="store.feedHasMore && store.feedEvents.length < feedHardCap" :label="store.feedLoadingMore ? '加载中…' : '加载更多'" text size="small" icon="pi pi-angle-down" @click="loadMoreFeed()" />
+        <!-- 用户 2026-09-22：「明明还可以加载，加载前他写的却是达展示上限，我觉得这个东西明明可以不设上限」⇒
+             撤掉对用户可见的"上限"语义：上限只作**自动触底**的静默保护，手动按钮永远可用。 -->
+        <div v-if="store.feedMoreError" class="feed-more-err">
+          <span>加载更多失败：{{ store.feedMoreError }}</span>
+          <Button label="重试" size="small" text icon="pi pi-refresh" @click="loadMoreFeed()" />
+        </div>
+        <Button v-else-if="store.feedHasMore" :label="store.feedLoadingMore ? '加载中…' : '加载更多'" text size="small" icon="pi pi-angle-down" @click="loadMoreFeed()" />
         <span v-else-if="store.feedEvents.length" class="feed-end">— 已加载全部动态 —</span>
         <!-- 哨兵始终渲染（条件渲染会导致 onMounted 拿不到元素、observer 失效） -->
         <div id="feed-sentinel" class="feed-sentinel"></div>
@@ -784,6 +801,8 @@ onUnmounted(() => {
 
 .c-time { font-size: 12px; color: var(--text-dim); line-height: 1.25; }
 .c-time small { display: block; font-size: 10px; opacity: 0.7; }
+/* 时间主体加大加深（用户反馈：PC 时间看不清、手机缺时间） */
+.ct-hm { font-size: 13.5px; color: var(--text); font-weight: 600; }
 .c-type { display: flex; align-items: center; }
 .c-type :deep(.p-tag) { font-size: 10.5px; }
 .c-player {
@@ -894,8 +913,8 @@ onUnmounted(() => {
 /* 移动端：简介变更允许换行完整显示（父级 .c-detail 已 wrap），避免长文本横向溢出 */
 @media (max-width: 899px) {
   .bio-text { white-space: normal; overflow: visible; text-overflow: clip; word-break: break-word; }
-  /* C1 触控目标：世界链接行内元素加大点击区域（16px→inline-flex + padding） */
-  .world-link { display: inline-flex; align-items: center; padding: 4px 8px; }
+  /* C1 触控目标：世界链接行内元素加大点击区域（16px→inline-flex + padding，min-height 32 达标） */
+  .world-link { display: inline-flex; align-items: center; padding: 4px 8px; min-height: 32px; }
 }
 
 /* 通知：消息内容（可点击打开群组） */
@@ -1001,10 +1020,10 @@ onUnmounted(() => {
     margin-bottom: 7px;
     background: var(--surface);
   }
-  /* 第一行：玩家(左) ｜ 日期单行(中) ｜ 类型(右) */
-  .c-time { grid-area: time; align-self: center; white-space: nowrap; font-size: 12px; }
+  /* 第一行：玩家(左) ｜ 时间+日期竖排(中) ｜ 类型(右) */
+  .c-time { grid-area: time; align-self: center; white-space: nowrap; font-size: 12px; text-align: center; }
   .c-type { grid-area: type; justify-self: end; align-self: center; }
-  .c-player { grid-area: player; align-self: center; min-width: 0; }
+  .c-player { grid-area: player; align-self: center; min-width: 0; min-height: 32px; }
   /* 第二行：详情全宽 */
   .c-detail { grid-area: detail; padding-top: 3px; border-top: 1px dashed var(--border-soft); }
   /* 移动端禁用展开：隐藏 chevron、去掉手型与展开高亮 */
@@ -1012,4 +1031,7 @@ onUnmounted(() => {
   .ev-row { cursor: default; }
   .ev-row.open { background: var(--surface); box-shadow: none; }
 }
+
+/* 2026-09-22 评审 💡：模板引用了 .feed-more-err 但样式表没定义 ⇒ 补上 ✓ */
+.feed-more-err { display: flex; align-items: center; justify-content: center; gap: 8px; padding: 10px 0; color: var(--text-dim); font-size: 12.5px; }
 </style>

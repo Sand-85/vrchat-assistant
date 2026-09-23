@@ -84,7 +84,7 @@
 - **GameLog 游戏日志**：后端 `dashboard.gameSessions` 服务 + `GET /api/dashboard/game-sessions`（user-location 聚合会话）；前端 logs 视图（会话数/总时长/会话时间线）。实测：最近 7 天 72 会话/785 分钟
 - **请求加入（VRCX 邀请对齐）**：后端 `POST /api/dashboard/invite-request`（request_invite 工具）；资料弹窗给在线好友显示「请求加入」按钮（toast 反馈）
 - **快速搜索 Ctrl+K（VRCX Quick Search 对齐）**：任意页面按 Ctrl+K/Cmd+K 弹出快速搜索覆盖层，输入即时匹配本地好友 + VRChat 用户搜索（防抖 300ms），点击打开资料；Esc 关闭
-- **状态预设（VRCX Social Status Presets 对齐）**：右侧栏状态预设（在线/加入我/问我/忙碌）+ 状态描述输入；`POST /api/dashboard/status`（PUT /auth/user/status）
+- **状态预设（VRCX Social Status Presets 对齐）**：右侧栏状态预设（在线/欢迎加入/忙碌/请勿打扰）+ 状态描述输入；`POST /api/dashboard/status`（PUT /auth/user/status）
 - **VRChat 服务器状态指示（受限）**：状态栏 `#vrcs` 显示 VRChat 服务器状态（`GET /api/dashboard/vrc-status`，status.vrchat.com）。**诚实限制**：路由器无法访问 status.vrchat.com（被墙/不可达），VRChat API 无替代公开端点——接口保留，失败时显示 VRC —
 - **好友备注全局显示（VRCX 对齐）**：`GET /api/dashboard/nicknames-all` 加载全部备注到 `state.nicknameMap`，`nameFor` 优先用备注名替换显示名（好友列表/事件流/资料统一显示备注名）
 - **Tools 快捷工具页**：世界/模型/用户/群组 ID → 生成 VRChat 链接（可打开/复制）
@@ -301,7 +301,9 @@
 用户选定 **PrimeVue 4 + Vite 构建**，允许全面重写前端（保留后端 API 与信息架构），目标桌面+移动双端。
 
 **关键决策**：
-- 构建在本地跑（路由器只发产物，Dockerfile `COPY . .` 直接带 `ui/dist`）；`vite-plugin-singlefile` 把所有 JS/CSS 打进一个 index.html（~1.06MB）→ `/dashboard` 仍是单文件请求，**无需静态资源鉴权白名单**（PrimeIcons 的 woff2/woff/eot 已内联，仅 SVG 因 `?#primeicons` 片段留在外部但现代浏览器走 woff2 不会请求，已从 dist 删除）
+> ⚠️ **本节决策已失效（2026-09-13，issue #186 方案 A）**：`ui/dist` 已出库，改为安装期（`npm run install-plugins` / `npm run build:dashboard`）与 Dockerfile 的 ui-builder 阶段构建；保留以下原始记录供追溯。
+
+- ~~构建在本地跑（路由器只发产物，Dockerfile `COPY . .` 直接带 `ui/dist`）~~；`vite-plugin-singlefile` 把所有 JS/CSS 打进一个 index.html（~1.06MB）→ `/dashboard` 仍是单文件请求，**无需静态资源鉴权白名单**（PrimeIcons 的 woff2/woff/eot 已内联，仅 SVG 因 `?#primeicons` 片段留在外部但现代浏览器走 woff2 不会请求，已从 dist 删除）
 - 认证不变：`?token=`/Header 鉴权；`/dashboard?legacy=1` 回退旧版 UI
 
 **里程碑 1 已部署（plugins/official/web-dashboard/ui/）**：
@@ -726,7 +728,7 @@ git diff --check
 
 - **非好友追踪 UI 重做**（用户反馈驱动）：卡片化列表 + 添加追踪面板（搜索用户→加入，幂等+立即刷新）+ 移除追踪（removed_at 标记持久化，种子不再复活）+ 打开资料/移除带文字按钮
 - **修复：自己误入追踪列表**——启动早期 /auth/user 失败时 selfId 为空；改为事件表推导（user-location/user-update 只会是自己的事件）+ API 兜底 + 启动清理 + 列表过滤 + 添加拒绝，四层防护
-- **在线状态显示**：刷新循环落库 status/statusDescription/location（迁移加列）；列表绿色圆点+状态徽章（在线/加入我/问我/忙碌/离线，对齐好友页）；在线优先排序
+- **在线状态显示**：刷新循环落库 status/statusDescription/location（迁移加列）；列表绿色圆点+状态徽章（在线/欢迎加入/忙碌/请勿打扰/离线，对齐好友页）；在线优先排序
 - **动态页「只看追踪」筛选**：trackedIds 加载 + 望远镜 chip，与只看关注/只看我并列；空态引导
 - **变化时间线类型筛选**：全部/头像/简介/状态 chips
 - **X 抓取尝试与回退**：chromium+Xvfb+代理基建验证可用，但 2026 X 全匿名通道封锁（Nitter 全灭/GraphQL 404/登录墙）——已回退基建保留 UI，文档注明环境限制

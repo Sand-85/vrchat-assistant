@@ -1,13 +1,23 @@
-import { readFileSync, existsSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseLimit, readJsonBody, sendHtml, sendJson } from './server/http.js';
 import { CACHE_TTLS, createDashboardState, setCached } from './server/state.js';
+import { safeModeBlockIrreversible } from './server/safe-mode.js';
 import { registerSearchRoutes } from './server/routes/search.js';
+import { readLoggerEntries, loggerFileInfo } from './server/logger-file.js';
 import { registerFavoriteRoutes } from './server/routes/favorites.js';
 import { registerAvatarRoutes, loadMe, loadAvatarName } from './server/routes/avatars.js';
 import { registerSocialRoutes } from './server/routes/social.js';
 import { registerImageProxyRoutes } from './server/routes/image-proxy.js';
+
+// 把 VRChat CDN 图片 URL 改写成本地 image-proxy（与本插件 server/routes/image-proxy.js 配套）。
+// 插件内联实现（core/img-util.js 的 imgProxy 同款域名白名单与包装），不 import core/（PLUGIN-API.md §7.1）。
+const imgProxyInline = (u) => {
+  if (!u) return u;
+  if (!/^https:\/\/(api\.vrchat\.cloud|d348imysud55la\.cloudfront\.net|assets\.vrchat\.com|files\.vrchat\.cloud)\//.test(String(u))) return u;
+  return '/api/dashboard/image-proxy?url=' + encodeURIComponent(u);
+};
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -32,8 +42,39 @@ const indexHtml = readFileSync(path.join(__dirname, 'dashboard.html'), 'utf8')
   .replaceAll('__DASHBOARD_APP_JS__', readFileSync(path.join(__dirname, 'client', 'js', 'vue', 'app.js'), 'utf8'));
 
 // 新 UI（Vite + PrimeVue 单文件构建）：存在则优先服务；?legacy=1 回退旧版
+// 产物出库（issue #186 方案 A）：dist 不入库，由安装期 `npm run install-plugins`（或
+// `npm run build:dashboard`）生成——此处做三态自检并暴露到 /health，杜绝静默降级。
 const uiDistIndex = path.join(__dirname, 'ui', 'dist', 'index.html');
+const uiSrcDir = path.join(__dirname, 'ui', 'src');
 const uiHtml = existsSync(uiDistIndex) ? readFileSync(uiDistIndex, 'utf8') : null;
+
+function newestMtimeMs(dir) {
+  let newest = 0;
+  try {
+    const walk = (d) => {
+      for (const e of readdirSync(d, { withFileTypes: true })) {
+        const p = path.join(d, e.name);
+        if (e.isDirectory()) walk(p);
+        else newest = Math.max(newest, statSync(p).mtimeMs);
+      }
+    };
+    walk(dir);
+  } catch { /* 源码目录缺失时按 0 处理 */ }
+  return newest;
+}
+const uiStatus = (() => {
+  if (!uiHtml) return { state: 'missing', builtAt: '', sourceUpdatedAt: '' };
+  try {
+    const builtAt = statSync(uiDistIndex).mtimeMs;
+    const src = newestMtimeMs(uiSrcDir);
+    return {
+      state: src > builtAt ? 'stale' : 'built',
+      builtAt: new Date(builtAt).toISOString(),
+      sourceUpdatedAt: src ? new Date(src).toISOString() : '',
+    };
+  } catch { return { state: 'unknown', builtAt: '', sourceUpdatedAt: '' }; }  // review #187 💡4：statSync 失败不乐观报 built
+})();
+// 三态自检 + 上报 /health 在 register(api) 内执行（api.log / api.health 可用，见下）
 
 // 群组信息缓存：VRChat API 限流 + 路由器网络延迟高（单请求 ~8-20s）。
 // info（名称/描述/公告）少变 → 30min；实例（当前开的房）动态 → 2min。
@@ -61,9 +102,33 @@ const EVT_TTL = 30 * 60_000;
 const evtInflight = new Map();   // window -> in-flight Promise（去重）
 
 export default function register(api) {
+  // 前端产物三态自检（issue #186 方案 A：dist 出库，安装期构建）+ 上报 /health
+  if (uiStatus.state === 'missing') {
+    api.log('[警告] dashboard 前端产物缺失（ui/dist/index.html）——/dashboard 将回退旧版 UI；'
+      + '修复: npm run build:dashboard（或 npm run install-plugins）');
+  } else if (uiStatus.state === 'stale') {
+    api.log(`[警告] dashboard 前端产物可能过期（源码 ${uiStatus.sourceUpdatedAt} 晚于产物 ${uiStatus.builtAt}）——`
+      + '建议重跑: npm run build:dashboard');
+  } else if (uiStatus.state === 'built') {
+    api.log(`[成功] dashboard 前端产物就绪（${uiStatus.builtAt}）`);
+  } else {
+    api.log(`[警告] dashboard 前端产物状态未知（${uiStatus.state}）——产物存在但元数据不可读，`
+      + '建议重跑: npm run build:dashboard');
+  }
+  // 能力探测：核心版本较旧或测试 mock 无 api.health 时静默跳过（不因可选扩展面崩插件加载）
+  if (typeof api.health === 'function') api.health({ dashboardUi: uiStatus });
+
   const dashboardState = createDashboardState();
   const { homeFavorites: homeFavCache } = dashboardState;
   const HOME_FAV_TTL = CACHE_TTLS.homeFavorites;
+
+  // 根路径 → /dashboard（裸域名访问不再看到 401 JSON；auth-guard 已豁免 GET/HEAD /）
+  const rootRedirect = async (_req, res) => {
+    res.writeHead(302, { Location: '/dashboard' });
+    res.end();
+  };
+  api.http.registerRoute({ method: 'GET', path: '/', handler: rootRedirect });
+  api.http.registerRoute({ method: 'HEAD', path: '/', handler: rootRedirect });
 
   api.http.registerRoute({
     method: 'GET',
@@ -310,6 +375,42 @@ export default function register(api) {
     handler: async (_req, res) => sendJson(res, await api.consume('dashboard.snapshot')),
   });
 
+  // 2026-09-22 首屏合并（使用者报障面板很慢；实测：局域网直连 94ms，公网反代域名 1.4-3.7s/请求）：
+  // 首屏原本打 7 个接口，这里把第一波 4 个并行取齐、一次返回；前端在不可用时自动回退逐个请求。
+  api.http.registerRoute({
+    method: 'GET',
+    path: '/api/dashboard/bootstrap',
+    handler: async (req, res) => {
+      const url = new URL(req.url, 'http://localhost');
+      const limit = parseLimit(url.searchParams.get('limit') || 50, 50, 200);
+      const dateFrom = url.searchParams.get('dateFrom') || '';
+      const dateTo = url.searchParams.get('dateTo') || '';
+      // ⚠️ api.consume 既有同步（如 eventsRange）也有异步实现 ⇒ 统一用 try/catch 包装（不能直接 .catch）
+      const safe = async (name, args) => {
+        try {
+          const r = api.consume(name, args);
+          return r && typeof r.then === 'function' ? await r : r;
+        } catch {
+          return null;
+        }
+      };
+      const [overview, friends, events, eventsRange] = await Promise.all([
+        safe('dashboard.snapshot'),
+        safe('dashboard.friends', { limit: 1000 }),
+        safe('dashboard.events', { limit, offset: 0, dateFrom, dateTo }),
+        safe('dashboard.eventsRange'),
+      ]);
+      const evs = events && Array.isArray(events.events) ? events.events : (Array.isArray(events) ? events : []);
+      sendJson(res, {
+        overview,
+        friends,
+        events: evs,
+        total: (events && events.total) || evs.length,
+        eventsRange: eventsRange || { min: null, max: null },
+      });
+    },
+  });
+
   api.http.registerRoute({
     method: 'GET',
     path: '/api/dashboard/friends',
@@ -396,16 +497,68 @@ export default function register(api) {
         const body = await readJsonBody(req);
         const userId = String((body && body.userId) || '').trim();
         if (!userId.startsWith('usr_')) return sendJson(res, { ok: false, error: 'bad-params: 需要 usr_ 开头的 userId' });
-        try {
-          const snap = await api.consume('dashboard.snapshot');
-          if (snap && snap.safeMode) {
-            return sendJson(res, { ok: false, error: '🔒 安全模式已启用：移除追踪属破坏性操作，已被禁用。' });
-          }
-        } catch { /* 快照不可用时放行 */ }
+        // #162：本地软删除（置 removed_at=now，可恢复），不属云端不可逆——safe-mode 下放行
         const r = await api.consume('dashboard.trackedRemove', { userId });
         sendJson(res, r);
       } catch (e) {
         sendJson(res, { ok: false, error: String(e.message || e) });
+      }
+    },
+  });
+
+  // VRChat 官方活动日历（三态：all/featured/following）
+  api.http.registerRoute({
+    method: 'GET',
+    path: '/api/dashboard/calendar',
+    handler: async (req, res) => {
+      try {
+        const u = new URL(req.url, 'http://localhost');
+        const scope = ['all', 'featured', 'following'].includes(u.searchParams.get('scope')) ? u.searchParams.get('scope') : 'all';
+        const n = Number(u.searchParams.get('n')) || 30;
+        const offset = Number(u.searchParams.get('offset')) || 0;
+        const r = await api.consume('dashboard.calendar', { scope, n, offset });
+        sendJson(res, r);
+      } catch (e) {
+        sendJson(res, { events: [], error: String(e.message || e) });
+      }
+    },
+  });
+
+  // 非好友追踪：备注（本地可恢复操作，safe-mode 下放行）
+  api.http.registerRoute({
+    method: 'POST',
+    path: '/api/dashboard/tracked/memo',
+    handler: async (req, res) => {
+      try {
+        const body = await readJsonBody(req);
+        const userId = String((body && body.userId) || '').trim();
+        if (!userId.startsWith('usr_')) return sendJson(res, { ok: false, error: 'bad-params: 需要 usr_ 开头的 userId' });
+        const r = await api.consume('dashboard.trackedMemo', { userId, memo: (body && body.memo) ?? '' });
+        sendJson(res, r);
+      } catch (e) {
+        sendJson(res, { ok: false, error: String(e.message || e) });
+      }
+    },
+  });
+  // 群组帖子（群组对话框帖子 Tab）
+  api.http.registerRoute({
+    method: 'GET',
+    path: '/api/dashboard/group-posts',
+    handler: async (req, res) => {
+      try {
+        const u = new URL(req.url, 'http://localhost');
+        const groupId = String(u.searchParams.get('groupId') || '').trim();
+        if (!groupId.startsWith('grp_')) return sendJson(res, { ok: false, error: 'bad-params: 需要 grp_ 开头的 groupId' });
+        const n = Number(u.searchParams.get('n')) || 20;
+        const offset = Number(u.searchParams.get('offset')) || 0;
+        const ck = `posts:${groupId}:${n}:${offset}`;
+        const hit = groupsCache.get(ck);
+        if (hit && Date.now() - hit.at < 120000) return sendJson(res, hit.data); // 帖子低频变更，2min 缓存（review #178 💡3）
+        const r = await api.consume('dashboard.groupPosts', { groupId, n, offset });
+        groupsCache.set(ck, { at: Date.now(), data: r });
+        sendJson(res, r);
+      } catch (e) {
+        sendJson(res, { ok: false, posts: [], error: String(e.message || e) });
       }
     },
   });
@@ -550,12 +703,7 @@ export default function register(api) {
         const body = await readJsonBody(req);
         const fileId = String((body && body.fileId) || '').trim();
         if (!fileId.startsWith('file_')) return sendJson(res, { ok: false, error: 'bad-params: 需要 file_ 开头的 fileId' });
-        try {
-          const snap = await api.consume('dashboard.snapshot');
-          if (snap && snap.safeMode) {
-            return sendJson(res, { ok: false, error: '🔒 安全模式已启用：删除画廊图片属破坏性操作，已被禁用。' });
-          }
-        } catch { /* 快照不可用时放行 */ }
+        if (await safeModeBlockIrreversible(api, res, '删除画廊图片')) return;
         const r = await api.tools.call('remove_gallery_image', { fileId, confirm: true });
         sendJson(res, r);
       } catch (e) {
@@ -684,6 +832,8 @@ export default function register(api) {
           });
           sendJson(res, { ok: !!r, avatarId, favorite: true });
         } else {
+          // #162：取消收藏=云端不可逆（DELETE /favorites/{id}），safe-mode 下拦截（此前漏网）
+          if (await safeModeBlockIrreversible(api, res, '取消收藏')) return;
           // 取消收藏：先按 avatarId 查收藏记录 id，再删除
           const favs = await api.vrchat.fetch('/favorites?type=avatar&n=100').catch(() => []);
           const hit = (Array.isArray(favs) ? favs : []).find((f) => f.favoriteId === avatarId);
@@ -735,12 +885,7 @@ export default function register(api) {
         const body = await readJsonBody(req);
         const printId = String((body && body.printId) || '').trim();
         if (!printId.startsWith('prnt_')) return sendJson(res, { ok: false, error: 'bad-params: 需要 prnt_ 开头的 printId' });
-        try {
-          const snap = await api.consume('dashboard.snapshot');
-          if (snap && snap.safeMode) {
-            return sendJson(res, { ok: false, error: '🔒 安全模式已启用：删除照片属破坏性操作，已被禁用。' });
-          }
-        } catch { /* 快照不可用时放行 */ }
+        if (await safeModeBlockIrreversible(api, res, '删除照片')) return;
         const r = await api.tools.call('remove_print', { printId, confirm: true });
         sendJson(res, r);
       } catch (e) {
@@ -849,10 +994,36 @@ export default function register(api) {
         const hit = groupsCache.get('mine');
         if (hit && Date.now() - hit.at < GROUPS_TTL) return sendJson(res, hit.data);
         const r = await api.tools.call('get_user_groups', {});
+        // 群头像 iconUrl 走本地图片代理（<img> 无需 token、国内可加载）
+        const groups = (r && r.groups) || [];
+        for (const g of groups) {
+          if (g.iconUrl) g.iconUrl = imgProxyInline(g.iconUrl);
+        }
         groupsCache.set('mine', { at: Date.now(), data: r });
         sendJson(res, r);
       } catch (e) {
         sendJson(res, { groups: [], error: String(e.message || e) });
+      }
+    },
+  });
+
+  // 收到的群组邀请（get_group_invites，self-only；缓存 5 分钟）
+  api.http.registerRoute({
+    method: 'GET',
+    path: '/api/dashboard/group-invites',
+    handler: async (_req, res) => {
+      try {
+        const hit = groupsCache.get('invites');
+        if (hit && Date.now() - hit.at < GROUPS_TTL) return sendJson(res, hit.data);
+        const r = await api.tools.call('get_group_invites', {});
+        const data = { invites: (r && r.invites) || [], total: (r && r.total) || 0 };
+        for (const g of data.invites) {
+          if (g.iconUrl) g.iconUrl = imgProxyInline(g.iconUrl);
+        }
+        groupsCache.set('invites', { at: Date.now(), data });
+        sendJson(res, data);
+      } catch (e) {
+        sendJson(res, { invites: [], error: String(e.message || e) });
       }
     },
   });
@@ -1035,6 +1206,37 @@ export default function register(api) {
     },
   });
 
+  // 动态状态（按在线好友数量自动更新自定义状态）：GET 配置与运行状态
+  api.http.registerRoute({
+    method: 'GET',
+    path: '/api/dashboard/dynamic-status',
+    handler: async (_req, res) => {
+      try {
+        sendJson(res, await api.consume('dashboard.dynamicStatusGet'));
+      } catch (e) {
+        sendJson(res, { enabled: false, template: '', error: String(e.message || e) });
+      }
+    },
+  });
+
+  // 动态状态：POST 保存（enabled/template），默认立即同步一次（绕过冷却——用户显式保存即意图明确）
+  api.http.registerRoute({
+    method: 'POST',
+    path: '/api/dashboard/dynamic-status',
+    handler: async (req, res) => {
+      try {
+        const body = await readJsonBody(req);
+        sendJson(res, await api.consume('dashboard.dynamicStatusSet', {
+          enabled: body.enabled,
+          template: body.template,
+          syncNow: body.syncNow !== false,
+        }));
+      } catch (e) {
+        sendJson(res, { ok: false, error: String(e.message || e) });
+      }
+    },
+  });
+
   api.http.registerRoute({
     method: 'GET',
     path: '/api/dashboard/search',
@@ -1098,6 +1300,25 @@ export default function register(api) {
         sendJson(res, await api.tools.call('get_ops_log', { limit, kind }));
       } catch (e) {
         sendJson(res, { items: [], error: String(e.message || e) });
+      }
+    },
+  });
+
+  // monitor.log 文件日志（structured logger 落盘）——日志页「文件」来源
+  api.http.registerRoute({
+    method: 'GET',
+    path: '/api/dashboard/logger',
+    handler: async (req, res) => {
+      const url = new URL(req.url, 'http://localhost');
+      const limit = parseLimit(url.searchParams.get('limit') || 200, 200, 1000);
+      const level = url.searchParams.get('level') || '';
+      const name = url.searchParams.get('name') || '';
+      const q = url.searchParams.get('q') || '';
+      try {
+        const r = readLoggerEntries({ limit, level, name, q });
+        sendJson(res, { items: r.items, info: loggerFileInfo() });
+      } catch (e) {
+        sendJson(res, { items: [], error: String(e.message || e), info: loggerFileInfo() });
       }
     },
   });
@@ -1239,6 +1460,22 @@ export default function register(api) {
         sendJson(res, { worlds: await api.consume('dashboard.recentWorlds', { limit }) });
       } catch (e) {
         sendJson(res, { worlds: [], error: String(e.message || e) });
+      }
+    },
+  });
+
+  // 好友地图统计（#165 数据层的 dashboard 消费面；imageUrl 已转 imgProxy）
+  api.http.registerRoute({
+    method: 'GET',
+    path: '/api/dashboard/friend-world-stats',
+    handler: async (req, res) => {
+      try {
+        const url = new URL(req.url, 'http://localhost');
+        const days = parseLimit(url.searchParams.get('days') || 30, 30, 365);
+        const limit = parseLimit(url.searchParams.get('limit') || 20, 20, 100);
+        sendJson(res, await api.consume('dashboard.friendWorldStats', { days, limit }));
+      } catch (e) {
+        sendJson(res, { stats: [], error: String(e.message || e) });
       }
     },
   });

@@ -138,7 +138,7 @@ export default function register(api) {
       const cached = await api.consume('storage.getWorldName', worldId);
       const name = cached?.name || data?.name || data?.displayName;
       if (name) result.displayName = name;
-      api.log(`⭐ 云端收藏: ${worldId} → ${group.tag} (${type})`);
+      api.log(`[收藏] 云端收藏: ${worldId} → ${group.tag} (${type})`);
       return result;
     } catch (e) {
       if (e.status >= 400) {
@@ -193,7 +193,7 @@ export default function register(api) {
     try {
       await api.consume('storage.setWorldFavorited', { worldId, favorited: 0 });
     } catch { /* 本地标记失败不影响 */ }
-    api.log(`✅ unfavorite_world: ${worldId} (${records.length} 条记录)`);
+    api.log(`[成功] unfavorite_world: ${worldId} (${records.length} 条记录)`);
     return { ok: true, worldId, removed: true, removedGroups: records.map(r => (r.tags || [])[0]) };
   }
 
@@ -358,7 +358,7 @@ export default function register(api) {
         method: 'POST',
         body: { favoriteId: targetId, tags: [group.name], type: 'friend' },
       });
-      api.log(`✅ favorite_friend: ${targetName || targetId} → ${group.displayName || group.name}`);
+      api.log(`[成功] favorite_friend: ${targetName || targetId} → ${group.displayName || group.name}`);
       return { ok: true, userId: targetId, displayName: targetName, groupName: group.displayName || group.name, favorited: true };
     } catch (e) {
       if (e.status === 400) {
@@ -395,7 +395,7 @@ export default function register(api) {
         if (e.status !== 404) throw e;
       }
     }
-    api.log(`✅ unfavorite_friend: ${targetName || targetId} (${records.length} 条记录)`);
+    api.log(`[成功] unfavorite_friend: ${targetName || targetId} (${records.length} 条记录)`);
     return { ok: true, userId: targetId, displayName: targetName, removed: true, removedGroups: records.map(r => (r.tags || [])[0]) };
   }
 
@@ -424,7 +424,7 @@ export default function register(api) {
       method: 'POST',
       body: { favoriteId: targetId, tags: [targetGroup.name], type: 'friend' },
     });
-    api.log(`✅ move_friend_group: ${targetName || targetId} → ${targetGroup.displayName || targetGroup.name}`);
+    api.log(`[成功] move_friend_group: ${targetName || targetId} → ${targetGroup.displayName || targetGroup.name}`);
     return { ok: true, userId: targetId, displayName: targetName, moved: true, fromGroups: oldRecords.map(r => (r.tags || [])[0]), toGroup: targetGroup.displayName || targetGroup.name };
   }
 
@@ -459,7 +459,7 @@ export default function register(api) {
     try {
       await api.consume('storage.setWorldFavorited', { worldId, favorited: 1 });
     } catch { /* 本地标记失败不影响 */ }
-    api.log(`✅ move_world_group: ${worldId} → ${target.displayName} (${target.type})`);
+    api.log(`[成功] move_world_group: ${worldId} → ${target.displayName} (${target.type})`);
     return { ok: true, worldId, moved: true, fromGroups: records.map(r => (r.tags || [])[0]), toGroup: target.displayName, toTag: target.tag };
   }
 
@@ -486,7 +486,7 @@ export default function register(api) {
       method: 'PUT',
       body,
     });
-    api.log(`✅ update_favorite_group: ${g.tag} ${JSON.stringify(body)}`);
+    api.log(`[成功] update_favorite_group: ${g.tag} ${JSON.stringify(body)}`);
     return { ok: true, group: g.displayName, tag: g.tag, type: g.type, updated: body };
   }
 
@@ -502,11 +502,11 @@ export default function register(api) {
     }
     if (count === 0) {
       // 空分组无内容可清，直接返回成功（DELETE 端点对空分组报 404 "favorites not found"）
-      api.log(`✅ clear_favorite_group: ${g.displayName}（空分组，无需清空）`);
+      api.log(`[成功] clear_favorite_group: ${g.displayName}（空分组，无需清空）`);
       return { ok: true, group: g.displayName, tag: g.tag, type: g.type, cleared: 0 };
     }
     await api.vrchat.fetch(`/favorite/group/${g.type}/${encodeURIComponent(g.tag)}/${g.ownerId}`, { method: 'DELETE' });
-    api.log(`✅ clear_favorite_group: ${g.displayName}（清空 ${count} 条）`);
+    api.log(`[成功] clear_favorite_group: ${g.displayName}（清空 ${count} 条）`);
     return { ok: true, group: g.displayName, tag: g.tag, type: g.type, cleared: count };
   }
 
@@ -558,7 +558,7 @@ export default function register(api) {
 
   api.registerTool({
     name: 'update_favorite_group',
-    description: '[write·收藏] 重命名收藏分组或修改可见性（PUT /favorite/group/{type}/{name}/{userId}）。group 为分组 tag 或 displayName；displayName（新名）/ visibility（friends/private/public）至少填一个。⚠️ 设为 public 会使收藏分组公开可见，隐私敏感，须显式 confirm。写操作，confirm: true 才执行。',
+    description: '[write·收藏] 重命名收藏分组或修改可见性（PUT /favorite/group/{type}/{name}/{userId}）。group 为分组 tag 或 displayName；displayName（新名）/ visibility（friends/private/public）至少填一个。注意：设为 public 会使收藏分组公开可见，隐私敏感，须显式 confirm。写操作，confirm: true 才执行。',
     inputSchema: {
       type: 'object',
       properties: {
@@ -589,7 +589,7 @@ export default function register(api) {
 
   api.registerTool({
     name: 'get_my_favorite_worlds',
-    description: '[查询·收藏] 拉取当前账号收藏的全部世界（含 VRC+ 专属收藏夹），按标签分类（🎮游戏/👻恐怖/🎵音乐体验/🌄风景观光/🧍Avatar模型/🍻社交聚会/😴休闲睡觉/📷拍照/其他），返回世界名/作者/收藏/浏览/简介/分类。数据经 GET /worlds/favorites 分页一次拉全（含实时 occupants），秒级返回，无需逐个查详情。group 参数可按收藏夹过滤。',
+    description: '[查询·收藏] 拉取当前账号收藏的全部世界（含 VRC+ 专属收藏夹），按标签分类（游戏/恐怖/音乐体验/风景观光/Avatar模型/社交聚会/休闲睡觉/拍照/其他），返回世界名/作者/收藏/浏览/简介/分类。数据经 GET /worlds/favorites 分页一次拉全（含实时 occupants），秒级返回，无需逐个查详情。group 参数可按收藏夹过滤。',
     inputSchema: {
       type: 'object',
       properties: {

@@ -12,7 +12,10 @@ import path from 'node:path';
 import net from 'node:net';
 
 import { ctx, log, refreshWatchlistCache } from './core/server-context.js';
-import { initLogger, getLevelName } from './core/logger.js';
+import { isWebPresence } from './core/event-pipeline.js';
+import { refreshFriendList } from './core/friend-refresh.js';
+import { avatarFileId, parseAvatarName } from './core/img-util.js';   // 2026-09-22 #225：fileId 提取统一走它（支持 /image/ 形态 + 代理 URL 还原）；#233 由 parseAvatarName 解析模型名
+import { initLogger, getLevelName, getLogger } from './core/logger.js';
 import { recordOpsLog, setOpsLogSink } from './core/ops-log.js';
 import * as registry from './core/registry.js';
 import { isSafeModeEnabled, DESTRUCTIVE_TOOLS } from './core/safe-mode.js';
@@ -22,6 +25,7 @@ import { VrchatApiClient } from './vrchat-api.js';
 import { WsManager } from './core/ws-manager.js';
 import { EventPipeline } from './core/event-pipeline.js';
 import { FriendStateManager } from './core/friend-state.js';
+import { DynamicStatusSync } from './core/status-sync.js';
 import { createServer } from './core/http-server.js';
 import { PluginLoader } from './core/plugin-loader.js';
 import { registerDashboardServices } from './core/dashboard-services.js';
@@ -44,8 +48,12 @@ import { handleRecommendWorlds } from './core/tools/recommend-worlds.js';
 import { parseTotpSecret, generateTotp } from './core/totp.js';
 import { notifier } from './core/notifier.js';
 import { buildChannels } from './core/notify-channels.js';
+import { decideTrackedFail } from './core/tracked-fail-policy.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
+const logApp = getLogger('app');
+const logMCP = getLogger('mcp');
 
 // ── .env 加载（只取 VRC_MONITOR_*）──
 // 注意：无条件覆盖 process.env——服务被插件 spawn 时可能继承旧值，跳过会导致 .env 配置失效
@@ -126,7 +134,7 @@ async function _refreshOnlineState() {
       if (r.data.length < 100) { complete = true; break; }
       offset += r.data.length;
     }
-    if (!complete) { log('⚠️ 刷新在线状态: 好友列表未拉全，跳过本轮对账'); return; }
+    if (!complete) { log('[警告] 刷新在线状态: 好友列表未拉全，跳过本轮对账'); return; }
 
     friendState.batchSetOnline(online.map(f => ({
       userId: f.id,
@@ -137,6 +145,16 @@ async function _refreshOnlineState() {
       // active/菜单中用户，location 为空者不算在线——issue #114 ⚠️2 复测遗留修复）
       isOnline: !!(f.location && f.location !== 'offline'),
     })));
+    // 网页端在线自愈（2026-09-10 用户报 bug：转网页在线后 friends 表残留最后进房世界）。
+    // REST 在线列表里 location='offline' 的条目=仅网页在线（VRChat 语义），把 platform/location
+    // 真值落 friends 表并清残留世界——与 WS friend-active(platform=web) 修复同口径。
+    for (const f of online) {
+      if (f.location === 'offline' && isWebPresence(f.platform)) {
+        try {
+          storage.upsertFriend({ userId: f.id, platform: f.platform || 'web', location: 'offline', worldId: '', worldName: '', isOnline: true, lastSeen: f.last_activity || new Date().toISOString() });
+        } catch { /* 单条失败不阻断对账 */ }
+      }
+    }
 
     // 断线窗口对账：WS 断开期间的好友下线事件会错过（下线不再广播），本地状态会卡在「在线」。
     // 好友表标记在线、但不在真实在线集合中的 → 置离线 + 补记 friend-offline 事件（动态流可见）。
@@ -186,9 +204,9 @@ async function _refreshOnlineState() {
       } catch { /* 补事件失败不影响状态对账 */ }
       fixed++;
     }
-    log(`🔄 刷新在线状态: 在线 ${online.length} 人${fixed ? `，断线窗口对账补离线 ${fixed} 人` : ''}`);
+    log(`[重连] 刷新在线状态: 在线 ${online.length} 人${fixed ? `，断线窗口对账补离线 ${fixed} 人` : ''}`);
   } catch (err) {
-    log(`⚠️ 刷新在线状态失败: ${err.message}`);
+    log(`[警告] 刷新在线状态失败: ${err.message}`);
   }
 }
 
@@ -217,9 +235,11 @@ async function _syncFriendAvatars() {
       for (const f of r.data) {
         // 模型 ID ↔ 图片映射：VRChat WS 推送的 friend-update 不含 currentAvatar（只有图片 URL），
         // 这里用全量好友列表建 imageUrl→avatarId 映射，供 events 服务富化模型变动事件的 avtr ID
-        const fm = String(f.currentAvatarImageUrl || '').match(/\/file\/(file_[a-f0-9-]+)/);
+        // 2026-09-22 #225：收敛到 avatarFileId()（原内联正则只认 /file/ ✗ ⇒ image 形态被静默跳过）
+        // 2026-09-22 评审纠正：avatarFileId() 返回字符串 ✗（原来按 match 数组取 fm[1] ⇒ 键退化成 avimg:i，所有好友挤一个键、后写覆盖）
+        const fm = avatarFileId(f.currentAvatarImageUrl) || '';
         if (fm && f.currentAvatar) {
-          try { storage.setPlanetCache(`avimg:${fm[1]}`, { avatarId: f.currentAvatar, at: Date.now() }); } catch { /* 落盘失败忽略 */ }
+          try { storage.setPlanetCache(`avimg:${fm}`, { avatarId: f.currentAvatar, at: Date.now() }); } catch { /* 落盘失败忽略 */ }
         }
         // VRChat API User 对象：头像字段 currentAvatarImageUrl/currentAvatarThumbnailImageUrl/userIcon，信任等级 trustLevel
         const av = f.currentAvatarImageUrl || f.currentAvatarThumbnailImageUrl || '';
@@ -239,9 +259,9 @@ async function _syncFriendAvatars() {
       if (r.data.length < 100) break;
     }
     }
-    if (updated) log(`🖼️ 好友头像补全: 更新 ${updated} 人（全量=在线+离线双列表）`);
+    if (updated) log(`[头像] 好友头像补全: 更新 ${updated} 人（全量=在线+离线双列表）`);
   } catch (err) {
-    log(`⚠️ 好友头像补全失败: ${err.message}`);
+    log(`[警告] 好友头像补全失败: ${err.message}`);
   }
 }
 
@@ -260,7 +280,7 @@ async function _seedTrackedNonFriends() {
     // 启动清理：移除历史误导入的自己
     if (selfId) {
       const del = ctx.storage.run(`DELETE FROM tracked_non_friends WHERE user_id = $u`, { $u: selfId });
-      if (del.changes > 0) log(`🧹 追踪列表移除误导入的自己（${selfId.slice(0, 12)}…）`);
+      if (del.changes > 0) log(`[清理] 追踪列表移除误导入的自己（${selfId.slice(0, 12)}…）`);
     }
     // 自动导入上限（issue #114 ⚠️3 复测遗留修复）：仅导入近 30 天出现过的非好友，最多 100 人——
     // 长历史全量导入会数百上千行，每小时逐人拉资料触发 VRChat 限流；手动添加不受此限
@@ -286,13 +306,15 @@ async function _seedTrackedNonFriends() {
       );
       added++;
     }
-    if (added) log(`⭐ 追踪非好友: 自动导入 ${added} 人（历史非好友，定时拉取资料/头像）`);
+    if (added) log(`[追踪] 追踪非好友: 自动导入 ${added} 人（历史非好友，定时拉取资料/头像）`);
   } catch (e) {
-    log(`⚠️ 追踪非好友初始化失败: ${e.message}`);
+    log(`[警告] 追踪非好友初始化失败: ${e.message}`);
   }
 }
 
 let _trackedRefreshRunning = false;  // 手动/定时刷新并发闸（防重复 diff 事件）
+
+const dn0 = (u) => u.display_name || u.user_id;
 
 async function _refreshTrackedNonFriends() {
   const { api, rateLimiter, storage } = ctx;
@@ -303,13 +325,67 @@ async function _refreshTrackedNonFriends() {
   for (const u of list) {
     try {
       const r = await rateLimiter.execute(() => api._request('GET', `/users/${encodeURIComponent(u.user_id)}`));
-      if (r.status !== 200 || !r.data || r.data.error) continue;
+      if (r.status !== 200 || !r.data || r.data.error) {
+        // 2026-09-23 issue #241（评审 ⚠️2 修正）：判定抽到 core/tracked-fail-policy.js 的纯函数 ✓
+        // 只把「明确 404」当永久失效 —— 429/5xx 等暂时性故障不累计，避免误杀有效条目（且不会自愈）✗
+        const d = decideTrackedFail({ failCount: u.fail_count, status: r.status, hasDataError: !!(r.data && r.data.error) });
+        try {
+          if (d.remove) {
+            storage.run(`UPDATE tracked_non_friends SET removed_at = $t, fail_count = $n WHERE user_id = $u`,
+              { $t: new Date().toISOString(), $n: d.next, $u: u.user_id });
+            log("[追踪] " + dn0(u) + " 连续 " + d.next + " 次" + d.reason + " => 判定为失效并移出刷新列表（数据保留、可手工恢复）");
+          } else {
+            storage.run(`UPDATE tracked_non_friends SET fail_count = $n WHERE user_id = $u`, { $n: d.next, $u: u.user_id });
+          }
+        } catch { /* 标记失败不影响刷新 */ }
+        continue;
+      }
+      // 成功 => 清零（曾有失败但恢复的条目）
+      if (u.fail_count) { try { storage.run(`UPDATE tracked_non_friends SET fail_count = 0 WHERE user_id = $u`, { $u: u.user_id }); } catch { /* 忽略 */ } }
       const userObj = r.data;
       const av = userObj.currentAvatarImageUrl || userObj.currentAvatarThumbnailImageUrl || userObj.userIcon || '';
       const dn = userObj.displayName || u.display_name || '';
+      // 2026-09-22：非好友也能拿信任等级（/users/{id} 的 tags 有值 ⇒ 与好友页同一套映射）
+      // 2026-09-22 评审 🔴：原先顶层 import 了 core/friend-refresh.js —— 该模块只由**仍 open 的 #222** 引入 ✗
+      // ⇒ 若本 PR 先合并，node start-monitor.js 会在加载阶段 ERR_MODULE_NOT_FOUND 直接崩 ✗
+      // ⇒ 改用**本文件既有**的 inferTrustFromTags()（main 上就有 ✓，映射与 VRCX computeTrustLevel 对齐 ✓）
+      const tl = (() => { try { return inferTrustFromTags(Array.isArray(userObj.tags) ? userObj.tags : []) || ''; } catch { return ''; } })();
+      // 2026-09-22：非好友的**当前模型名**也能拿 ✓（实测：iconUrl 的 fileId → GET /file/{id} → name = 「Avatar - 模型名 - Image - …」✓）
+      // 与事件补名共用同一张缓存 planet_cache 的 avatar_name:<fid> ✓；解析不到就留空、不覆盖旧值 ✓
+      // ⚠️ 失败时也写一条 miss（6 小时 TTL）—— 否则每次刷新都会重试同一批不可解析的 fileId ✗
+      const parseAvName = parseAvatarName;
+      let avatarName = '';
+      try {
+        const fid = avatarFileId(userObj.iconUrl || '');
+        if (fid) {
+          const cached = ctx.storage.query('SELECT payload FROM planet_cache WHERE key = $k', { $k: 'avatar_name:' + fid })[0];
+          let hit = null;
+          if (cached) { try { hit = JSON.parse(cached.payload); } catch { /* 忽略 */ } }
+          if (hit && typeof hit.until === 'number' && hit.until <= Date.now()) hit = null;
+          if (hit) avatarName = hit.name || '';
+          else {
+            const fr = await rateLimiter.execute(() => api._request('GET', '/file/' + encodeURIComponent(fid)));
+            // 实测 iconUrl 有时是「用户头像/相机图」而非模型图 ✗ ⇒ 文件名形如 file_xxx_camera_user_icon
+            // 这类**不是模型名**，必须过滤 ✓（真模型名解析后是纯名字，如「测试」✓）
+            // 2026-09-22 评审 ⚠️2：只挡 file_ 前缀是不够的 —— iconUrl 也可能指向资料头像/相机图，
+            // 文件名可为任意值（实测 selfie.png / My cute avatar / IMG_20240101_123456.jpg 都会被原过滤当模型名）
+            // ⇒ 改为只采信 VRChat 模型文件的命名形态「Avatar - <名> - Image …」
+            const rawName = String((fr && fr.data && fr.data.name) || '');
+            const parsed = String(parseAvName(rawName) || '');
+            avatarName = /^Avatar\s*-\s*/i.test(rawName) ? parsed : '';
+            try {
+              ctx.storage.setPlanetCache('avatar_name:' + fid, avatarName
+                ? { name: avatarName, at: Date.now() }
+                : { name: '', miss: true, until: Date.now() + 6 * 3600 * 1000 });
+            } catch { /* 落盘失败不影响刷新 */ }
+            if (avatarName) { try { log('[模型名] 追踪解析 ' + fid.slice(0, 16) + '… → ' + avatarName); } catch { /* 忽略 */ } }
+          }
+        }
+      } catch { /* 解析失败留空，下次再试 */ }
       // 头像变化检测：按 file id 归一化比较（防 currentAvatarImageUrl vs Thumbnail 兜底链或 URL 版本号 /1/ vs /3/ 波动误报）
       const prevAv = u.avatar_image_url || '';
-      const fileIdOf = (url) => { const m = String(url || '').match(/\/file\/(file_[a-f0-9-]+)/); return m ? m[1] : ''; };
+      // 2026-09-22 #225：同上，统一用 avatarFileId()（它会先还原代理 URL ✓ 且支持 /image/ 形态 ✓）
+      const fileIdOf = (url) => avatarFileId(url) || '';
       const changed = fileIdOf(av) && fileIdOf(prevAv) ? fileIdOf(av) !== fileIdOf(prevAv) : (av !== prevAv);
       if (av && prevAv && changed) {
         try {
@@ -318,17 +394,51 @@ async function _refreshTrackedNonFriends() {
             contentJson: { userId: u.user_id, displayName: dn || u.display_name || '', type: 'avatar', avatarImageUrl: av, previousAvatarImageUrl: prevAv },
             worldId: '', worldName: '', createdAt: new Date().toISOString(), source: 'poll',
           });
-          log(`⭐ 追踪非好友头像变化: ${dn || u.user_id}`);
+          log(`[追踪] 追踪非好友头像变化: ${dn || u.user_id}`);
         } catch { /* 记录失败不影响刷新 */ }
       }
       const st = userObj.status || '';
       const stDesc = userObj.statusDescription || '';
       const loc = userObj.location || '';
-      if (av || dn || st) {
+      if (av || dn || st || loc) {
         storage.run(
-          `UPDATE tracked_non_friends SET avatar_image_url=$a, display_name=$d, status=$s, status_description=$sd, location=$l, last_refresh_at=datetime('now') WHERE user_id=$u`,
-          { $a: av, $d: dn, $s: st, $sd: stDesc, $l: loc, $u: u.user_id }
+          `UPDATE tracked_non_friends SET avatar_image_url=$a, display_name=$d, status=$s, status_description=$sd, location=$l, trust_level=$tl, last_refresh_at=datetime('now') WHERE user_id=$u`,
+          { $a: av, $d: dn, $s: st, $sd: stDesc, $l: loc, $tl: tl || (u.trust_level || ''), $u: u.user_id }
         );
+      }
+      // location/上下线变化检测（#146）：轮询 1h 低频，offline/offline:offline/traveling 离线态微动与转场不记录
+      const locPrev = u.location || '';
+      const locOffline = (v) => { const s = String(v || ''); return s === '' || s === 'offline' || s === 'offline:offline' || s === 'traveling'; };
+      if (String(loc) !== String(locPrev) && !(locOffline(loc) && locOffline(locPrev))) {
+        try {
+          const lastLoc = storage.query(
+            `SELECT created_at FROM events WHERE user_id=$u AND type='friend-update'
+             AND json_extract(content_json,'$.type')='location' ORDER BY id DESC LIMIT 1`, { $u: u.user_id });
+          let locSkip = false;
+          if (lastLoc.length) {
+            const dt = (Date.now() - new Date(lastLoc[0].created_at).getTime()) / 1000;
+            if (dt >= 0 && dt < 300) locSkip = true; // 5 分钟去重窗（轮询 1h 几乎不触发，防御编辑型高频）
+          }
+          if (!locSkip) {
+            let wId = '', wName = '';
+            if (!locOffline(loc)) {
+              const w0 = String(loc).split(':')[0];
+              if (w0.startsWith('wrld_')) {
+                wId = w0;
+                try {
+                  const wc = storage.query(`SELECT name FROM world_cache WHERE world_id=$w LIMIT 1`, { $w: w0 });
+                  if (wc.length) wName = wc[0].name || '';
+                } catch { /* 无缓存忽略 */ }
+              }
+            }
+            storage.insertEvent({
+              type: 'friend-update', userId: u.user_id, displayName: dn || u.display_name || '',
+              contentJson: { userId: u.user_id, displayName: dn || u.display_name || '', type: 'location', location: String(loc), previousLocation: locPrev, worldId: wId, worldName: wName, avatarImageUrl: av },
+              worldId: wId, worldName: wName, createdAt: new Date().toISOString(), source: 'poll',
+            });
+            log('[追踪] 追踪非好友位置变化: ' + (dn || u.user_id) + ' ' + (locPrev || '离线') + ' → ' + (loc || '离线'));
+          }
+        } catch { /* 记录失败不影响刷新 */ }
       }
       _recordNonFriendChange(u.user_id, dn, userObj, av);
       // 回填历史事件头像（之前没存头像的事件，如 VRCX 迁移数据）
@@ -347,7 +457,7 @@ async function _refreshTrackedNonFriends() {
       ok++;
     } catch { /* 404/网络错误跳过，非致命 */ }
   }
-  if (ok) log(`⭐ 追踪非好友刷新: ${ok}/${list.length} 位已更新`);
+  if (ok) log(`[追踪] 追踪非好友刷新: ${ok}/${list.length} 位已更新`);
 }
 
 // 对照 events 表该用户最新 bio/status 事件，变化则记录（事件带头像）
@@ -441,7 +551,7 @@ function registerCoreServices(loader, ctx) {
   ];
   for (const name of whitelist) {
     if (typeof ctx.storage[name] !== 'function') {
-      log(`⚠️ 核心存储服务 ${name} 不存在，跳过`);
+      log(`[警告] 核心存储服务 ${name} 不存在，跳过`);
       continue;
     }
     const svc = `storage.${name}`;
@@ -615,7 +725,7 @@ async function main() {
   //    第二个实例早已抢走/消费验证码，触发 VRChat 重复下发，造成邮箱验证码轰炸
   if (await isPortBusy(PORT)) {
     console.error('');
-    console.error(`❌ 端口 ${PORT} 已被占用，检测到监控服务可能已在运行`);
+    console.error(`[失败] 端口 ${PORT} 已被占用，检测到监控服务可能已在运行`);
     console.error('   为避免双实例并存互抢 OTP 验证码（造成邮箱验证码轰炸），本进程将退出。');
     console.error('   请先确认旧实例状态并结束残留进程后重启：');
     console.error('     Windows: netstat -ano | findstr 8799  或  tasklist | findstr node');
@@ -628,17 +738,17 @@ async function main() {
 
   // 0b. 安全模式（VRC_MONITOR_SAFE_MODE=true）：启动即剔除破坏性工具，tools/list 不暴露、tools/call 拦截
   if (isSafeModeEnabled()) {
-    log('\n🔒 安全模式已启用（VRC_MONITOR_SAFE_MODE=true）');
+    log('\n[认证] 安全模式已启用（VRC_MONITOR_SAFE_MODE=true）');
     log(`   已移除 ${DESTRUCTIVE_TOOLS.length} 个破坏性工具: ${DESTRUCTIVE_TOOLS.join(', ')}`);
   } else {
-    log('\n🔓 安全模式未启用（VRC_MONITOR_SAFE_MODE 未设置或非 true）');
+    log('\n[认证] 安全模式未启用（VRC_MONITOR_SAFE_MODE 未设置或非 true）');
   }
 
   // 0c. 旧数据迁移（issue #103）：根目录旧文件 → data/
   migrateLegacyData(__dirname, path.join(__dirname, 'data'));
 
   // 1. 初始化数据库
-  log('📦 初始化数据库...');
+  log('[初始化] 初始化数据库...');
   ctx.storage = new Storage();
 // 服务运维日志（ops_log）：认证/连接生命周期打点的落库出口
 setOpsLogSink((kind, level, message) => {
@@ -649,14 +759,14 @@ setOpsLogSink((kind, level, message) => {
   // 服务进程启动打点：必须在 storage.init（建表）与 sink 接线之后，否则静默失败
   recordOpsLog('ops', 'info', `服务进程启动（v${APP_VERSION}，部署/容器重建/手动重启）`);
   ctx.serverState.version = APP_VERSION;
-  log(`   ✅ 数据库就绪: ${DB_PATH}`);
-  log(`   📊 事件: ${stats.events} 条 | 好友: ${stats.friends} 位 | 世界缓存: ${stats.world_cache} 个`);
+  log(`   [成功] 数据库就绪: ${DB_PATH}`);
+  log(`   [统计] 事件: ${stats.events} 条 | 好友: ${stats.friends} 位 | 世界缓存: ${stats.world_cache} 个`);
   refreshWatchlistCache();  // 初始化 watchlist 内存缓存
 
   // 2. 初始化 API 客户端
-  log('\n🔑 初始化 API 客户端...');
+  log('\n[认证] 初始化 API 客户端...');
   if (!existsSync(CRED_FILE)) {
-    console.error('\n❌ 未找到 credentials.json — 无法登录 VRChat');
+    console.error('\n[失败] 未找到 credentials.json — 无法登录 VRChat');
     console.error('');
     console.error('   请先完成配置：');
     console.error('   1. 复制 credentials.example.json 为 credentials.json');
@@ -669,12 +779,12 @@ setOpsLogSink((kind, level, message) => {
   try {
     creds = JSON.parse(readFileSync(CRED_FILE, 'utf-8'));
   } catch (parseErr) {
-    console.error(`\n❌ credentials.json 解析失败: ${parseErr.message}`);
+    console.error(`\n[失败] credentials.json 解析失败: ${parseErr.message}`);
     console.error('   请检查文件是否为合法 JSON（参考 credentials.example.json 模板）');
     process.exit(1);
   }
   if (!creds.email || !creds.password) {
-    console.error('\n❌ credentials.json 缺少 email 或 password 字段');
+    console.error('\n[失败] credentials.json 缺少 email 或 password 字段');
     console.error('   请参考 credentials.example.json 补全配置');
     process.exit(1);
   }
@@ -694,9 +804,9 @@ setOpsLogSink((kind, level, message) => {
         return [counter - 1, counter, counter + 1].map((c) => generateTotp(secretBytes, c, { digits, algorithm }));
       };
       ctx.api.setTotpFetcher(totpFetcher);
-      log(`   🔐 TOTP 自动登录已启用（digits=${digits}, period=${period}s, ${algorithm}，前后窗口容错）`);
+      log(`   [认证] TOTP 自动登录已启用（digits=${digits}, period=${period}s, ${algorithm}，前后窗口容错）`);
     } catch (parseErr) {
-      console.error(`   ⚠️ totp_secret 解析失败（${parseErr.message}）：TOTP 自动登录不可用，将回退手动 submit_totp`);
+      console.error(`   [警告] totp_secret 解析失败（${parseErr.message}）：TOTP 自动登录不可用，将回退手动 submit_totp`);
     }
   }
 
@@ -708,7 +818,7 @@ setOpsLogSink((kind, level, message) => {
       notifyConfig = JSON.parse(readFileSync(NOTIFY_FILE, 'utf-8'));
     }
   } catch (cfgErr) {
-    console.error(`   ⚠️ notify-config.json 解析失败（${cfgErr.message}），通知已关闭`);
+    console.error(`   [警告] notify-config.json 解析失败（${cfgErr.message}），通知已关闭`);
     notifyConfig = { enabled: false };
   }
   notifier.configure(notifyConfig);
@@ -716,30 +826,30 @@ setOpsLogSink((kind, level, message) => {
     notifier.registerChannel(ch);
   }
   if (notifier.enabled) {
-    log(`   🔔 登录状态主动通知已启用（通道: ${(notifyConfig.channels || []).join(', ') || '无'}，连续失败阈值 ${notifier.config.consecutiveFailThreshold}，间隔 ${notifier.config.minIntervalSec}s）`);
+    log(`   [通知] 登录状态主动通知已启用（通道: ${(notifyConfig.channels || []).join(', ') || '无'}，连续失败阈值 ${notifier.config.consecutiveFailThreshold}，间隔 ${notifier.config.minIntervalSec}s）`);
   }
   ctx.api.loadCookieFromFile(COOKIE_FILE);
   try {
     const user = await ctx.api.ensureAuthWithAutoOtp(fetchOtpFromEmail);
     ctx.serverState.authUser = { id: user.id, displayName: user.displayName };
     ctx.serverState.needsOtp = false;
-    log(`   ✅ 已登录: ${user.displayName} (${user.id})`);
+    log(`   [成功] 已登录: ${user.displayName} (${user.id})`);
     ctx.api.saveCookieToFile(COOKIE_FILE);
   } catch (err) {
     ctx.serverState.needsOtp = false;
     ctx.serverState.needsTotp = !!err.needsTotp;
     if (err.needsTotp) {
       if (totpFetcher) {
-        log(`   ⚠️ 账号需要 TOTP 验证码：已配置自动登录，将在认证冷却后自动重试（或调用 submit_totp 手动提交）`);
+        log(`   [警告] 账号需要 TOTP 验证码：已配置自动登录，将在认证冷却后自动重试（或调用 submit_totp 手动提交）`);
         notifier.notifyAuth('needsTotp', '账号需要 TOTP 验证码（已配置自动登录，若持续失败请检查 totp_secret 或手动提交）');
       } else {
-        log(`   ⚠️ 账号启用 TOTP 两步验证：请调用 MCP 工具 submit_totp 提交当前验证码（或在 credentials.json 配置 totp_secret 启用自动登录）`);
+        log(`   [警告] 账号启用 TOTP 两步验证：请调用 MCP 工具 submit_totp 提交当前验证码（或在 credentials.json 配置 totp_secret 启用自动登录）`);
         notifier.notifyAuth('needsTotp', '账号需要 TOTP 验证码，服务暂停——请调用 submit_totp 提交当前验证码');
       }
     } else {
       notifier.notifyAuth('otpFailed', `启动登录失败：${err.message}`);
     }
-    log(`   ❌ 登录失败: ${err.message}`);
+    log(`   [失败] 登录失败: ${err.message}`);
     // 不退出进程，让 MCP/WS 服务启动以便后续重试
   }
 
@@ -749,10 +859,15 @@ setOpsLogSink((kind, level, message) => {
 
   // 4. 初始化好友状态管理器
   ctx.friendState = new FriendStateManager();
-  log(`\n👥 好友状态管理器就绪`);
+  log(`\n[好友] 好友状态管理器就绪`);
 
   // 5. 初始化事件处理管道
   ctx.eventPipeline = new EventPipeline(ctx.storage, null);
+
+  // 5.4 动态状态引擎（按在线好友数量自动更新自定义状态；默认关闭,MCP set_dynamic_status 控制）
+  ctx.statusSync = new DynamicStatusSync(ctx, { log });
+  const _statusSyncLowFreq = () => { ctx.statusSync.sync().catch(() => {}); };
+  setInterval(_statusSyncLowFreq, 5 * 60 * 1000); // 定时核对兜底(事件驱动为主)
 
   // 5.5 加载插件（失败不阻断核心启动）
   const pluginLoader = new PluginLoader({ registry, ctx, log, notifier });
@@ -762,10 +877,10 @@ setOpsLogSink((kind, level, message) => {
   pluginLoader.watch();
   ctx.pluginLoader = pluginLoader;
   log(` 插件系统就绪`);
-  log(`📨 事件处理管道就绪`);
+  log(`[事件] 事件处理管道就绪`);
 
   // 6. 启动 WebSocket
-  log('\n🔌 启动 WebSocket 连接...');
+  log('\n[连接] 启动 WebSocket 连接...');
   ctx.wsManager = new WsManager({
     apiClient: ctx.api,
     otpFetcher: fetchOtpFromEmail,
@@ -773,19 +888,24 @@ setOpsLogSink((kind, level, message) => {
       try {
         await ctx.eventPipeline.process(event);
         await _updateFriendState(event);
-        
+
+        // 动态状态：在线好友数量变化（上线/下线）即触发核对（引擎内置 unchanged 早退 + 冷却防刷）
+        if (event.type === 'friend-online' || event.type === 'friend-offline') {
+          ctx.statusSync.sync().catch(() => {});
+        }
+
         // 核心关注好友活动日志（从内存缓存读取，不查 DB）
         if (ctx.watchlist.dirty) refreshWatchlistCache();
         const isWatched = ctx.watchlist.cache.some(w => w.user_id === event.userId);
         if (isWatched) {
-          log(`⭐ [关注] ${event.displayName || event.userId}: ${event.type}`);
+          log(`[追踪] [关注] ${event.displayName || event.userId}: ${event.type}`);
         }
       } catch (err) {
-        log(`⚠️ 事件处理失败: ${err.message}`);
+        logApp.error(`事件处理失败: ${err.message}`, { stack: err.stack, type: event?.type, userId: event?.userId });
       }
     },
     onStatusChange: (status) => {
-      log(`🔌 WebSocket: ${status}`);
+      log(`[连接] WebSocket: ${status}`);
       if (status === 'connected') {
         // 连接后延迟对账：先让重连突发的实时推送（上线/下线）落地，再对账补漏，避免双记
         setTimeout(() => { _refreshOnlineState().catch(() => {}); }, 25_000);
@@ -795,7 +915,7 @@ setOpsLogSink((kind, level, message) => {
             ctx.serverState.authUser = { id: res.user.id, displayName: res.displayName };
           }
         }).catch((err) => {
-          log(`⚠️ 认证复查失败: ${err.message}`);
+          log(`[警告] 认证复查失败: ${err.message}`);
         });
       }
     },
@@ -806,9 +926,9 @@ setOpsLogSink((kind, level, message) => {
   const runAutoBackup = async () => {
     try {
       const r = await ctx.storage.backup(BACKUP_DIR);
-      log(`💾 自动备份完成: ${r.path} (${r.size} bytes)`);
+      log(`[备份] 自动备份完成: ${r.path} (${r.size} bytes)`);
     } catch (e) {
-      log(`⚠️ 自动备份失败: ${e.message}`);
+      log(`[警告] 自动备份失败: ${e.message}`);
     }
   };
   runAutoBackup();
@@ -817,6 +937,22 @@ setOpsLogSink((kind, level, message) => {
   // 7a. 好友头像补全：启动 90s 后首次 + 每 6 小时（低频，只补空头像）
   setTimeout(_syncFriendAvatars, 90 * 1000);
   setInterval(_syncFriendAvatars, 6 * 3600 * 1000);
+
+  // 好友资料权威刷新（issue：trust_level 陈旧无自愈；#222 审核 🔴1 指出本接线缺失 → 补上）：
+  // 启动 60 秒后跑首轮（部署即自愈存量陈旧等级），之后每 VRC_MONITOR_FRIEND_REFRESH_HOURS（默认 6）小时一次；
+  // 刷新时回写非空资料字段 + 记录 trust_level 变化事件；每周期上限 VRC_MONITOR_FRIEND_REFRESH_MAX（默认 50）。
+  const FRIEND_REFRESH_HOURS = Math.max(1, Number(process.env.VRC_MONITOR_FRIEND_REFRESH_HOURS) || 6);
+  const runFriendRefresh = () => {
+    // #222 审核 💡2：未认证时跳过（否则每周期 50 次 401 + 逐个触发自动重认证 ✗）；
+    // 且异常必须记一行（原来的 .catch(() => {}) 会静默吞掉模块级异常 ✗）。
+    if (!ctx.serverState || !ctx.serverState.authUser) {
+      log('[追踪] 好友资料刷新跳过：尚未认证（避免未登录时打 401）');
+      return;
+    }
+    refreshFriendList(ctx, log).catch((e) => log('[警告] 好友资料刷新异常: ' + e.message));
+  };
+  setTimeout(runFriendRefresh, 60_000);
+  setInterval(runFriendRefresh, FRIEND_REFRESH_HOURS * 3600 * 1000);
 
   // 7a2. 追踪非好友（VRCX-Luo 对齐）：启动 20s 后自动导入历史非好友并首次拉取，之后每小时刷新
   setTimeout(async () => {
@@ -828,10 +964,10 @@ setOpsLogSink((kind, level, message) => {
   // 7b. 启动 MCP 服务
   const server = createServer();
   server.listen(PORT, HOST, () => {
-    log(`\n🚀 MCP 服务运行在 http://${HOST}:${PORT}/mcp\n`);
-    log('可用工具:');
+    log(`\n[启动] MCP 服务运行在 http://${HOST}:${PORT}/mcp\n`);
+    log(`可用工具: ${registry.listTools().length} 个（完整清单通过 tools/list 或 /health 查询）`);
     for (const t of registry.listTools()) {
-      log(`  ${t.name} — ${t.description}`);
+      logMCP.debug(`  ${t.name} — ${t.description}`);
     }
     log(`\n健康检查: http://${HOST}:${PORT}/health`);
     log('\n按 Ctrl+C 停止\n');
@@ -846,13 +982,15 @@ main().catch(err => {
 // ── 优雅关闭 ──
 async function shutdown(signal) {
   recordOpsLog('ops', 'info', `服务进程停止（${signal}——容器重建/手动停止）`);
-  const { wsManager, eventPipeline, storage } = ctx;
-  log(`\n⚠️ 收到 ${signal}，正在关闭...`);
+  const { wsManager, eventPipeline, storage, rateLimiter } = ctx;
+  log(`\n[警告] 收到 ${signal}，正在关闭...`);
   try {
     if (wsManager) wsManager.stop();
     if (eventPipeline) eventPipeline.flush();
+    // review #193 🟡：退出前把未满窗口的慢等待聚合桶 flush 出来，否则「禁静默降级」只对运行期成立
+    if (rateLimiter && typeof rateLimiter.flushSlowWaitAgg === 'function') rateLimiter.flushSlowWaitAgg();
     if (storage) storage.save();
-    log('✅ 已保存数据');
+    log('[成功] 已保存数据');
   } catch (e) {
     console.error('关闭时出错:', e);
   }
@@ -862,15 +1000,16 @@ process.on('SIGINT', () => shutdown('SIGINT'));
 process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('beforeExit', () => {
   if (ctx.eventPipeline) ctx.eventPipeline.flush();
+  if (ctx.rateLimiter && typeof ctx.rateLimiter.flushSlowWaitAgg === 'function') ctx.rateLimiter.flushSlowWaitAgg();
   if (ctx.storage) ctx.storage.save();
 });
 
 // ── 全局异常兜底（防止僵尸进程 + 端口残留）──
 process.on('uncaughtException', (err) => {
-  console.error('💥 Uncaught Exception:', err);
+  console.error('[崩溃] Uncaught Exception:', err);
   shutdown('uncaughtException');
 });
 process.on('unhandledRejection', (reason) => {
-  console.error('💥 Unhandled Rejection:', reason);
+  console.error('[崩溃] Unhandled Rejection:', reason);
   shutdown('unhandledRejection');
 });

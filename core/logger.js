@@ -1,4 +1,5 @@
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import zlib from 'node:zlib';
 import { fileURLToPath } from 'node:url';
@@ -61,16 +62,37 @@ const state = {
   console: true,
   color: 'auto',
   suppress: [],
+  syslogPrefix: false,
   filePath: '',
   fileEnabled: false,
   closed: false,
   pid: process.pid,
 };
 
+// 级别名 → syslog 优先级（RFC 5424）：debug=7 info=6 warn=4 error=3。
+// 仅在 VRC_MONITOR_LOGGER_SYSLOG_PREFIX 开启时给 stdout 行加 `<N>` 前缀，
+// 供 systemd（SyslogLevelPrefix= 默认 true）解析成 journald 的 PRIORITY 字段，
+// 使 `journalctl -p warning` 等按级别过滤生效。文件输出永不加此前缀。
+const SYSLOG_LEVELS = { debug: 7, info: 6, warn: 4, error: 3 };
+
+function syslogPrefixFor(levelName) {
+  const pri = SYSLOG_LEVELS[String(levelName).toLowerCase()];
+  return pri === undefined ? '' : `<${pri}>`;
+}
+
 function resolveDir() {
   // 日志模块专属变量名（VRC_MONITOR_LOGGER_DIR），不与 AGENTS.md 里 service-windows 用的 VRC_MONITOR_LOG_DIR 撞名
   if (process.env.VRC_MONITOR_LOGGER_DIR) {
     return path.resolve(process.env.VRC_MONITOR_LOGGER_DIR);
+  }
+  // node --test 上下文（node --test 子进程 NODE_TEST_CONTEXT=child-v8，已实测）：
+  // 任何继承 VRC_MONITOR_DIR 的测试进程都会把日志写进生产目录（实测 96 行 wrld_kbtest-*
+  // 测试夹具污染主仓库生产日志），单点防御落到系统临时目录与生产日志物理隔离。
+  // 显式 VRC_MONITOR_LOGGER_DIR 永远优先（上方分支），此处只在未显式指定时兜底。
+  if (process.env.NODE_TEST_CONTEXT) {
+    const dir = path.join(os.tmpdir(), 'vrc-monitor-test-logs');
+    console.info(`[logger] 检测到 node --test 上下文，日志落盘改用临时目录: ${dir}（如需显式指定请设 VRC_MONITOR_LOGGER_DIR）`);
+    return dir;
   }
   if (process.env.VRC_MONITOR_DIR) {
     return path.join(process.env.VRC_MONITOR_DIR, 'logs');
@@ -140,6 +162,11 @@ function buildConfig(options) {
     suppress: parseSuppress(
       envOrOpt('VRC_MONITOR_LOGGER_SUPPRESS', 'suppress')
     ),
+    file: parseBool(envOrOpt('VRC_MONITOR_LOGGER_FILE', 'file'), true),
+    syslogPrefix: parseBool(
+      envOrOpt('VRC_MONITOR_LOGGER_SYSLOG_PREFIX', 'syslogPrefix'),
+      false
+    ),
   };
 }
 
@@ -155,10 +182,18 @@ export function initLogger(options = {}) {
   state.console = cfg.console;
   state.color = cfg.color;
   state.suppress = cfg.suppress;
+  state.syslogPrefix = cfg.syslogPrefix;
   state.filePath = path.join(state.dir, 'monitor.log');
-  state.fileEnabled = true;
+  state.fileEnabled = cfg.file;
   state.closed = false;
   state.pid = process.pid;
+
+  // 文件输出被显式关闭（VRC_MONITOR_LOGGER_FILE=0）时不建目录、不校验可写：
+  // 用于 systemd/journald 场景避免「文件 + journald」双份落盘（stdout 始终保留）。
+  if (!cfg.file) {
+    state.filePath = '';
+    return state;
+  }
 
   try {
     fs.mkdirSync(state.dir, { recursive: true });
@@ -282,7 +317,11 @@ function writeToConsole(levelName, line) {
   const useColor =
     state.color === true ||
     (state.color === 'auto' && process.stdout.isTTY && state.format === 'text');
-  if (useColor) {
+  // syslog 前缀必须落在行首（systemd 逐行解析 `<N>`）；ANSI 色码会挡在它前面导致解析失败，
+  // 故开启前缀时强制不着色（systemd 下 stdout 非 TTY，auto 本就为假，这里是防御性保证）。
+  if (state.syslogPrefix) {
+    output = `${syslogPrefixFor(levelName)}${line}`;
+  } else if (useColor) {
     output = applyColor(line, levelName);
   }
 
@@ -396,8 +435,19 @@ function write(levelName, name, msg, meta) {
 
   if (state.fileEnabled && state.filePath) {
     try {
-      checkRotation(line);
-      fs.appendFileSync(state.filePath, `${line}\n`, 'utf8');
+      // 多行消息按行拆分落盘：每行都带完整前缀。否则「前缀+空正文」行会被解析成
+      // 空条目（日志页出现空行）、无前缀的续行（如 `\n[启动]...` 的正文、error.stack）
+      // 会被解析器整行丢弃（日志页数据丢失）。空段跳过——装饰性 '\n' 不再产生空行。
+      const fileLines = state.format === 'json'
+        ? [line]
+        : redactedMsg.split('\n')
+            .map((s) => s.trim())
+            .filter(Boolean)
+            .map((seg) => formatText(ts, levelName, name, seg));
+      for (const fl of fileLines) {
+        checkRotation(fl);
+        fs.appendFileSync(state.filePath, `${fl}\n`, 'utf8');
+      }
     } catch (err) {
       if (state.console) {
         console.error(`[logger] 写入日志文件失败: ${err.message}`);
@@ -435,6 +485,25 @@ export function getLevelName(level) {
     if (val === n) return name;
   }
   return 'info';
+}
+
+/**
+ * 运行期日志配置快照（供 /health 只读暴露）。
+ * 不触发初始化：未初始化时字段为默认值（filePath 为空 = 尚未落盘目录）。
+ * 不含任何凭据/内容，仅配置元数据（level/format/dir/filePath/file/console/syslogPrefix）。
+ */
+export function getLoggerInfo() {
+  return {
+    level: getLevelName(state.level),
+    format: state.format,
+    dir: state.dir,
+    filePath: state.filePath,
+    // 报**生效值**而非配置值：目录不可写时会降级（fileEnabled=false + filePath=''），
+    // 若仍报配置的 true 会与空 filePath 自相矛盾、误导「日志在哪」的自诊断。
+    file: state.fileEnabled,
+    console: state.console,
+    syslogPrefix: state.syslogPrefix,
+  };
 }
 
 export function rotate() {

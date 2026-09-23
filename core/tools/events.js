@@ -59,6 +59,58 @@ export function handleGetFriendPairScreen({ userIdA, userIdB, startTime, endTime
  * 复用周报的同屏合并引擎（getWeeklyCompanions：北京自然日逐日 findCompanions 匹配），
  * 输出精简为列表（matchCount/daysCount/lastDay），供 dashboard 右侧栏与 MCP Agent 消费。
  */
+/**
+ * 好友地图统计：好友群体在 N 天内去过的世界按热度聚合（发现好玩的图）。
+ * 数据源 = events 的 friend-location（好友进世界，WS 推送；world_id 含 wrld_ 前缀，
+ * private/friends/group 实例同属 wrld_ 世界，local:/offline 天然不在）。
+ * 口径：visitors = 去过该世界的不同好友数（主排序），visits = 总进入次数（次排序），
+ * lastSeen = 最近一次。世界资料（名称/图/作者）优先 world_cache，事件携带 world_name 兜底。
+ * 纯本地查询，无 VRChat API 调用，不受限流约束。
+ */
+export function handleGetFriendWorldStats({ days = 30, limit = 20 } = {}) {
+  const { storage } = ctx;
+  const d = Math.min(Math.max(Number.parseInt(days, 10) || 30, 1), 365);
+  const lim = Math.min(Math.max(Number.parseInt(limit, 10) || 20, 1), 100);
+  const since = new Date(Date.now() - d * 86400000).toISOString();
+  const rows = storage.query(
+    `SELECT world_id AS worldId, user_id AS userId,
+            MAX(COALESCE(NULLIF(display_name, ''), '?')) AS dn,
+            COUNT(*) AS visits,
+            MAX(COALESCE(NULLIF(world_name, ''), '')) AS eventName,
+            MAX(created_at) AS lastSeen
+       FROM events
+      WHERE type = 'friend-location' AND world_id LIKE 'wrld_%' AND created_at >= $since
+      GROUP BY world_id, user_id
+      ORDER BY worldId, visits DESC`,
+    { $since: since });
+  const byWorld = new Map();
+  for (const r of rows) {
+    let w = byWorld.get(r.worldId);
+    if (!w) { w = { worldId: r.worldId, eventName: r.eventName || '', visits: 0, visitors: 0, lastSeen: '', friends: [] }; byWorld.set(r.worldId, w); }
+    w.visitors += 1;
+    w.visits += r.visits;
+    if (r.lastSeen > w.lastSeen) w.lastSeen = r.lastSeen;
+    if (w.friends.length < 5) w.friends.push(r.dn);
+  }
+  const stats = [...byWorld.values()]
+    .sort((a, b) => b.visitors - a.visitors || b.visits - a.visits || (a.lastSeen < b.lastSeen ? 1 : -1))
+    .slice(0, lim)
+    .map((w) => {
+      const wc = storage.getWorldName(w.worldId);
+      return {
+        worldId: w.worldId,
+        worldName: (wc && wc.name) || w.eventName || '',
+        imageUrl: (wc && wc.image_url) || '',
+        authorName: (wc && wc.author_name) || '',
+        visitors: w.visitors,
+        visits: w.visits,
+        lastSeen: w.lastSeen,
+        friends: w.friends,
+      };
+    });
+  return { windowDays: d, count: stats.length, stats };
+}
+
 export function handleGetRecentCooplay({ days = 7, limit = 30 } = {}) {
   const { storage, serverState } = ctx;
   const meId = serverState.authUser?.id;
@@ -100,16 +152,27 @@ export function handleGetOpsLog({ limit = 200, kind } = {}) {
 
 export function handleGetRecentEvents({ limit = 30, offset = 0, typeFilter, userIdFilter }) {
   const { storage } = ctx;
+  const types = typeFilter ? String(typeFilter).split(',').map(t => t.trim()).filter(Boolean) : [];
+  if (types.length > 0) {
+    // SQL 层类型过滤（2026-09-06 修复）：原实现先取最近 limit+offset 条再内存过滤，
+    // 低频类型（friend-delete 等）被高频事件挤出滚动窗口后永远查不到历史；
+    // 改走 WHERE type IN(...) 全史检索，typeFilter 语义 =「该类型最近 N 条」而非「全局窗口内命中」。
+    const events = storage.getEventsFiltered({
+      types,
+      userId: userIdFilter || '',
+      limit,
+      offset,
+    });
+    return { total: events.length, events };
+  }
+  // 无类型过滤：保持原「最新事件流」语义
   let events;
   if (userIdFilter) {
-    events = storage.getEventsByUser(userIdFilter, { limit, offset });
+    events = storage.getEventsByUser(userIdFilter, { limit: limit + offset });
+    if (offset > 0) events = events.slice(offset);
   } else {
     events = storage.getRecentEvents({ limit: limit + offset });
     if (offset > 0) events = events.slice(offset);
-  }
-  if (typeFilter) {
-    const typeSet = new Set(typeFilter.split(',').map(t => t.trim()));
-    events = events.filter(e => typeSet.has(e.type));
   }
   return { total: events.length, events };
 }
@@ -215,7 +278,7 @@ export async function handleGetWorldsByAuthor({ authorId, authorName, limit = 10
     offset += r.data.length;
   }
 
-  log(`🔍 get_worlds_by_author: ${resolvedAuthorName} (${resolvedAuthorId}) → ${worlds.length} 张图`);
+  log(`[查询] get_worlds_by_author: ${resolvedAuthorName} (${resolvedAuthorId}) → ${worlds.length} 张图`);
   return { authorId: resolvedAuthorId, authorName: resolvedAuthorName, total: worlds.length, worlds };
 }
 
@@ -447,7 +510,7 @@ export const tools = [
   },
   {
     "name": "get_recent_events",
-    "description": "[query] Get the latest event stream from local database.",
+    "description": "[query] 事件流查询：无 typeFilter 时返回最新事件（最近滚动窗口）；带 typeFilter 时为 SQL 层按类型检索——返回该类型最近的事件（可查任意历史，非仅当前窗口），如 typeFilter='friend-delete' 可查被删除好友记录。",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -461,7 +524,7 @@ export const tools = [
         },
         "typeFilter": {
           "type": "string",
-          "description": "Comma-separated event types to filter"
+          "description": "Comma-separated event types to filter (SQL-level history search)"
         },
         "userIdFilter": {
           "type": "string",
@@ -473,17 +536,17 @@ export const tools = [
   },
   {
     "name": "get_friend_pair_meeting",
-    "description": "[query] 查询两个好友（任意第三方）之间「每次见面」的时段与时长（单次见面分析）。按实例切分：同一实例内所有同屏匹配事件合并为一次见面，返回每次的 start/end/durationMinutes、世界与实例；同时给出 meetingCount（见面次数）与 totalDurationSeconds（总时长）。精确口径：B 的每条可识别实例事件匹配 A 同一实例且时间差 ≤ windowMinutes → 计同屏；排除 offline/traveling/private（private 无房主信息无法判定同房）。startTime/endTime 与 days 二选一，windowMinutes 默认 30。",
+    "description": "[query] 查询任意两个用户（含自己）之间「每次见面」的时段与时长（单次见面分析）；self-pair 时 userIdA/B 可填自己的 userId（服务端同时扫描 user-location 与 friend-location 两类事件，与 get_friend_pair_screen 共用匹配引擎）。按实例切分：同一实例内所有同屏匹配事件合并为一次见面，返回每次的 start/end/durationMinutes、世界与实例；同时给出 meetingCount（见面次数）与 totalDurationSeconds（总时长）。精确口径：B 的每条可识别实例事件匹配 A 同一实例且时间差 ≤ windowMinutes → 计同屏；排除 offline/traveling/private（private 无房主信息无法判定同房）。startTime/endTime 与 days 二选一，windowMinutes 默认 30。",
     "inputSchema": {
       "type": "object",
       "properties": {
         "userIdA": {
           "type": "string",
-          "description": "好友 A 的 userId（usr_...），必填"
+          "description": "用户 A 的 userId（usr_...），必填（可以是好友，也可以是自己，用于 self-pair）"
         },
         "userIdB": {
           "type": "string",
-          "description": "好友 B 的 userId（usr_...），必填"
+          "description": "用户 B 的 userId（usr_...），必填（可以是好友，也可以是自己，用于 self-pair）"
         },
         "startTime": {
           "type": "string",
@@ -511,17 +574,17 @@ export const tools = [
   },
   {
     "name": "get_friend_pair_screen",
-    "description": "[query] 查询两个好友（任意第三方）之间的同屏次数与时长（共玩/同房分析）。精确口径：对好友 B 的每条可识别实例事件，找好友 A 在同一实例且时间戳在 ±windowMinutes 内的匹配，计为一次同屏；排除 offline/traveling/private（private 无房主信息无法判定同房）。不同时间去过同一房间不计。返回 matchCount（次数）、totalMinutes/totalSeconds（总同屏时长，段首到段尾累加，含实例内中途断开空档）、worldDuration（按世界拆分时长）、worlds（共现世界）与 matches（匹配事件对，默认全量，可用 limit 限制条数——采样密集时 matches 可能上千条）。startTime/endTime 与 days 二选一，windowMinutes 默认 30。",
+    "description": "[query] 查询任意两个用户（含自己）之间的同屏次数与时长（共玩/同房分析）；self-pair 时 userIdA/B 可填自己的 userId（与 get_recent_cooplay 的 meId 一致；服务端会同时扫描 user-location 与 friend-location 两类事件）。精确口径：对好友 B 的每条可识别实例事件，找好友 A 在同一实例且时间戳在 ±windowMinutes 内的匹配，计为一次同屏；排除 offline/traveling/private（private 无房主信息无法判定同房）。不同时间去过同一房间不计。返回 matchCount（次数）、totalMinutes/totalSeconds（总同屏时长，段首到段尾累加，含实例内中途断开空档）、worldDuration（按世界拆分时长）、worlds（共现世界）与 matches（匹配事件对，默认全量，可用 limit 限制条数——采样密集时 matches 可能上千条）。startTime/endTime 与 days 二选一，windowMinutes 默认 30。",
     "inputSchema": {
       "type": "object",
       "properties": {
         "userIdA": {
           "type": "string",
-          "description": "好友 A 的 userId（usr_...），必填"
+          "description": "用户 A 的 userId（usr_...），必填（可以是好友，也可以是自己，用于 self-pair）"
         },
         "userIdB": {
           "type": "string",
-          "description": "好友 B 的 userId（usr_...），必填"
+          "description": "用户 B 的 userId（usr_...），必填（可以是好友，也可以是自己，用于 self-pair）"
         },
         "startTime": {
           "type": "string",
@@ -570,8 +633,26 @@ export const tools = [
     handler: async (args) => handleGetRecentCooplay(args)
   },
   {
+    "name": "get_friend_world_stats",
+    "description": "[query] 好友地图统计：好友群体在最近 N 天去过的世界按热度聚合——visitors（去过该世界的不同好友数，主排序）、visits（总进入次数）、lastSeen、friends（部分好友名样本 ≤5），并补全世界名称/缩略图/作者（world_cache 优先，事件携带名兜底）。用于发现好友圈里热门/好玩的图。days(1-365 默认 30)、limit(1-100 默认 20)。纯本地统计，无 VRChat API 调用。",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "days": {
+          "type": "number",
+          "description": "统计窗口天数（1-365，默认 30）"
+        },
+        "limit": {
+          "type": "number",
+          "description": "返回世界数上限（1-100，默认 20）"
+        }
+      }
+    },
+    handler: async (args) => handleGetFriendWorldStats(args)
+  },
+  {
     "name": "get_ops_log",
-    "description": "[query·运维] 查询服务运维日志（认证/WS/运维生命周期事件，保留最近 500 条）：返回 items[{ id, kind, level, message, createdAt }]。limit(1-1000 默认 200)、kind(可选 filter，'auth'|'ws'|'ops')。",
+    "description": "[query·运维] 查询服务运维日志（认证/WS/运维生命周期/外部调用事件，保留最近 500 条）：返回 items[{ id, kind, level, message, createdAt }]。limit(1-1000 默认 200)、kind(可选 filter，'auth'|'ws'|'ops'|'api'|'ext')。其中 'api'=VRChat REST 调用失败/超时，'ext'=外部服务（PlanetVRC/X/BOOTH/Google Calendar/IMAP-OTP）失败与降级兜底。",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -581,7 +662,7 @@ export const tools = [
         },
         "kind": {
           "type": "string",
-          "description": "类别过滤：auth|ws|ops（可选）"
+          "description": "类别过滤：auth|ws|ops|api|ext（可选）"
         }
       }
     },

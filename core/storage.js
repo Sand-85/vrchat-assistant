@@ -78,6 +78,17 @@ export class Storage {
     if (!tnfCols.some(c => c.name === 'removed_at')) {
       this._run(`ALTER TABLE tracked_non_friends ADD COLUMN removed_at TEXT DEFAULT ''`);
     }
+    // 迁移：失效重试计数（issue #241；幂等，自己的列 + 自己的条件块）
+    if (!tnfCols.some(c => c.name === 'fail_count')) {
+      this._run(`ALTER TABLE tracked_non_friends ADD COLUMN fail_count INTEGER DEFAULT 0`);
+    }
+    if (!tnfCols.some(c => c.name === 'memo')) {
+      this._run(`ALTER TABLE tracked_non_friends ADD COLUMN memo TEXT DEFAULT ''`);
+    }
+    // 迁移：追踪对象缺信任等级列（2026-09-22，幂等；实测 tags 对非好友有值 ⇒ 可算）
+    if (!tnfCols.some(c => c.name === 'trust_level')) {
+      this._run(`ALTER TABLE tracked_non_friends ADD COLUMN trust_level TEXT DEFAULT ''`);
+    }
     // 迁移：旧库 world_cache 缺 note 列
     const worldCols = this._query(`PRAGMA table_info(world_cache)`);
     if (!worldCols.some(c => c.name === 'note')) {
@@ -313,6 +324,32 @@ export class Storage {
     sql += ` ORDER BY created_at DESC LIMIT $limit`;
     params.$limit = limit;
     return this._query(sql, params);
+  }
+
+  /**
+   * 按类型（可多值）/用户/起始时间在 SQL 层过滤查事件（分页，时间倒序）。
+   * 与 getRecentEvents 的区别：type 过滤发生在 WHERE（非「先取最近 N 条再内存过滤」），
+   * 低频类型（如 friend-delete）不会被高频事件挤出滚动窗口——历史类型可全史检索
+   * （2026-09-06：get_recent_events(typeFilter='friend-delete') 查不到历史即此因）。
+   * types: 非空数组（至少一个元素）；userId/since 可选；limit/offset 分页。
+   */
+  getEventsFiltered({ types = [], userId = '', since = '', limit = 50, offset = 0 } = {}) {
+    const where = [];
+    const params = {};
+    if (types.length > 0) {
+      const ph = types.map((_, i) => `$t${i}`).join(',');
+      types.forEach((t, i) => { params[`$t${i}`] = t; });
+      where.push(`type IN (${ph})`);
+    }
+    if (userId) { where.push(`user_id = $userId`); params.$userId = userId; }
+    if (since) { where.push(`created_at >= $since`); params.$since = since; }
+    const wsql = where.length > 0 ? ` WHERE ${where.join(' AND ')}` : '';
+    params.$limit = limit;
+    params.$offset = offset;
+    return this._query(
+      `SELECT * FROM events${wsql} ORDER BY created_at DESC LIMIT $limit OFFSET $offset`,
+      params
+    );
   }
 
   getEventsByTimeRange(start, end, { limit = 1000 } = {}) {

@@ -10,6 +10,10 @@ const data = ref(null);
 const q = ref('');
 const expanded = ref('');
 const loading = ref(false);
+// 公告图片放大预览（lightbox）
+const previewImg = ref('');
+function openImage(src) { if (src) previewImg.value = src; }
+function closePreview() { previewImg.value = ''; }
 
 async function load() {
   if (loading.value) return;
@@ -113,6 +117,7 @@ onMounted(load);
         <button type="button" class="ga-row" @click="toggle(a)">
           <div class="ga-info">
             <div class="ga-line">
+              <img v-if="a.imageUrl" class="ga-gav" :src="a.imageUrl" alt="" loading="lazy" />
               <button v-if="a.groupId" class="ga-group" @click.stop="openGroup(a.groupId)"><i class="pi pi-users"></i> {{ a.groupName || a.groupId }}</button>
               <b class="ga-title">{{ a.title || '（无标题）' }}</b>
               <span v-if="isNew(a)" class="ga-new">新</span>
@@ -122,6 +127,7 @@ onMounted(load);
           <i class="pi ga-chev" :class="expanded === a.eventId ? 'pi-chevron-up' : 'pi-chevron-down'" aria-hidden="true"></i>
         </button>
         <div v-if="expanded === a.eventId" class="ga-detail">
+          <img v-if="a.imageUrl" class="ga-img" :src="a.imageUrl" alt="" loading="lazy" title="点击查看原图" @click="openImage(a.imageUrl)" role="button" tabindex="0" @keydown.enter="openImage(a.imageUrl)" />
           <p class="ga-text">{{ a.text || '（无内容）' }}</p>
           <div class="ga-copyrow">
             <Button size="small" text icon="pi pi-copy" label="复制全文" @click="copyAnnouncement(a)" />
@@ -129,6 +135,13 @@ onMounted(load);
         </div>
         </template>
       </div>
+    </div>
+
+    <!-- 公告图片放大预览（lightbox） -->
+    <div v-if="previewImg" class="ga-preview" @click.self="closePreview" role="dialog" aria-modal="true" aria-label="图片预览">
+      <img :src="previewImg" class="ga-preview-img" alt="公告图片预览" @click.self="closePreview" />
+      <Button icon="pi pi-times" rounded text class="ga-preview-close" aria-label="关闭预览" @click="closePreview" />
+      <a class="ga-preview-open" :href="previewImg" target="_blank" rel="noopener">新标签打开</a>
     </div>
   </div>
 </template>
@@ -149,6 +162,8 @@ onMounted(load);
 .ga-row:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 .ga-info { min-width: 0; flex: 1; display: flex; flex-direction: column; gap: 2px; }
 .ga-line { display: flex; align-items: center; gap: 8px; min-width: 0; }
+/* 公告行群封面小头像（群组名左边） */
+.ga-gav { width: 42px; height: 42px; border-radius: 10px; object-fit: cover; flex: none; }
 .ga-group { background: none; border: 1px solid var(--border); color: var(--accent); border-radius: 999px; padding: 1px 9px; font-size: 11px; cursor: pointer; flex: none; display: inline-flex; align-items: center; gap: 4px; font-family: inherit; }
 .ga-group:hover { border-color: var(--accent); }
 .ga-title { font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; flex: 0 1 auto; }
@@ -158,6 +173,13 @@ onMounted(load);
 .ga-detail { background: var(--surface-2); border: 1px solid var(--border-soft); border-radius: 8px; padding: 10px 12px; margin-left: 20px; }
 .ga-text { font-size: 13px; line-height: 1.6; margin: 0; white-space: pre-wrap; word-break: break-word; }
 .ga-copyrow { display: flex; justify-content: flex-end; margin-top: 4px; }
+/* 公告封面大图 + 放大预览遮罩 */
+.ga-img { display: block; max-width: 100%; max-height: 260px; border-radius: 8px; margin-bottom: 8px; object-fit: contain; cursor: zoom-in; border: 1px solid var(--border-soft); }
+.ga-preview { position: fixed; inset: 0; z-index: 3000; background: rgba(0,0,0,0.85); display: flex; align-items: center; justify-content: center; padding: 24px; }
+.ga-preview-img { max-width: 100%; max-height: 100%; object-fit: contain; border-radius: 6px; box-shadow: 0 8px 40px rgba(0,0,0,0.6); }
+.ga-preview-close { position: fixed; top: 14px; right: 14px; color: #fff; background: rgba(255,255,255,0.14); }
+.ga-preview-open { position: fixed; bottom: 16px; left: 50%; transform: translateX(-50%); color: #fff; font-size: 12px; background: rgba(255,255,255,0.16); padding: 6px 14px; border-radius: 999px; text-decoration: none; }
+.ga-preview-open:hover { background: rgba(255,255,255,0.28); }
 
 
 @media (max-width: 899px) {

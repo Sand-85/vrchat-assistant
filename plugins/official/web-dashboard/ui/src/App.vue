@@ -1,7 +1,21 @@
 <script setup>
-import { computed, ref, onMounted, onUnmounted } from 'vue';
+import { computed, ref, onMounted, onUnmounted, onErrorCaptured } from 'vue';
 import { useToast } from 'primevue/usetoast';
-import { store, setView, load, enableNotifications, disableNotifications } from './store.js';
+import { store, setView, load, startDashboard, enableNotifications, disableNotifications } from './store.js';
+
+// 2026-09-22 用户报障「请求正常但右边整块黑的」：全项目此前**没有任何渲染错误兜底** ✗ ⇒ 子组件报错会让那一块静默变黑 ✓。
+// 捕获后代组件的渲染/生命周期错误 → 写进全局失败横幅（store.loadError ✓）+ 控制台留痕，让症状可见而非黑屏 ✓。
+// 真正的「渲染错误边界」（2026-09-22 二次修正）：仅写横幅+return false 不够 ✗ ——
+// 当时 App 仍会继续渲染那棵坏掉的子树 ⇒ 用户看到的是**所有页面全黑** ✓（实测反馈）。
+// 正确做法：捕获后**用替代面板顶掉坏视图**，其余骨架（侧栏/右栏）继续可用，并给「重试/刷新」两条出路 ✓。
+const renderErr = ref('');
+const reloadPage = () => { try { location.reload(); } catch { /* 忽略 */ } };
+onErrorCaptured((err) => {
+  const msg = (err && err.message) ? err.message : String(err);
+  console.error('[dashboard] 渲染错误：', err);
+  renderErr.value = msg;
+  return false;   // 阻止冒泡（替代面板由本组件渲染 ✓）
+});
 import { bindToast, toast } from './toast.js';
 import FeedView from './views/FeedView.vue';
 import FriendsView from './views/FriendsView.vue';
@@ -19,6 +33,7 @@ import BoothView from './views/BoothView.vue';
 import AnnouncementsView from './views/AnnouncementsView.vue';
 import ModerationView from './views/ModerationView.vue';
 import ToolsView from './views/ToolsView.vue';
+import SettingsView from './views/SettingsView.vue';
 import OpenView from './views/OpenView.vue';
 import WeeklyReportView from './views/WeeklyReportView.vue';
 import XWorldsView from './views/XWorldsView.vue';
@@ -34,7 +49,7 @@ import GroupDialog from './components/GroupDialog.vue';
 import InstanceDialog from './components/InstanceDialog.vue';
 import AvatarDialog from './components/AvatarDialog.vue';
 import LoginView from './components/LoginView.vue';
-import { hasToken, clearToken } from './api.js';
+import { hasToken, clearToken, probeAuthRequired } from './api.js';
 import { useConfirm } from 'primevue/useconfirm';
 import { bindConfirm } from './confirm.js';
 
@@ -74,6 +89,7 @@ const NAV_GROUPS = [
   { g: '管理', items: [
     { view: 'moderation', ico: 'pi pi-ban', label: '屏蔽' },
     { view: 'tools', ico: 'pi pi-wrench', label: '工具' },
+    { view: 'settings', ico: 'pi pi-cog', label: '设置' },
     { view: 'open', ico: 'pi pi-external-link', label: '直接打开' },
   ]},
 ];
@@ -93,6 +109,24 @@ onMounted(() => document.addEventListener('scroll', onAnyScroll, true));
 
 // ── 登录页控制 ──
 const loginView = ref(!hasToken());
+// 本地无 token 时先裸探测服务端是否真的要令牌（api.js probeAuthRequired）：
+// 未启用鉴权（单机默认）→ 直接进面板，不再逼用户输入一个从未配置过的令牌（issue #213）；
+// 探测失败（服务未启动 / 网络异常）保留登录门，由登录页给出连接错误提示。
+const authChecking = ref(loginView.value);
+onMounted(async () => {
+  if (!loginView.value) return;
+  try {
+    if (!(await probeAuthRequired())) {
+      store.authRequired = false;   // 服务端不需要鉴权 => 放行数据加载（否则未启用令牌的部署会零请求）
+      loginView.value = false;
+    } else {
+      store.authRequired = true;
+    }
+    if (!loginView.value) startDashboard();   // 2026-09-22：登录成功后才拉数据（登录页此前会打全部接口 ✗）
+  } catch { /* 保留登录门 */ } finally {
+    authChecking.value = false;
+  }
+});
 function onAuth401() { loginView.value = true; }
 onMounted(() => window.addEventListener('vrc-auth-401', onAuth401));
 onUnmounted(() => window.removeEventListener('vrc-auth-401', onAuth401));
@@ -143,7 +177,11 @@ async function refresh() {
 </script>
 
 <template>
-  <LoginView v-if="loginView" />
+  <div v-if="authChecking" class="auth-probe">
+    <i class="pi pi-spin pi-spinner"></i>
+    <span>正在检查访问鉴权…</span>
+  </div>
+  <LoginView v-else-if="loginView" />
   <div v-else class="app-shell">
     <header class="app-header">
       <Button v-if="store.isMobile" icon="pi pi-bars" text rounded @click="store.navOpen = true" aria-label="打开菜单" />
@@ -176,6 +214,23 @@ async function refresh() {
       </nav>
 
       <main class="main-viewport">
+        <!-- 2026-09-22：渲染错误边界——坏视图被替代面板顶掉，其余部分仍可用 ✓ -->
+        <div v-if="renderErr" class="render-err">
+          <i class="pi pi-exclamation-triangle" aria-hidden="true"></i>
+          <b>这个页面渲染出错了</b>
+          <small>{{ renderErr }}</small>
+          <div class="render-err-actions">
+            <Button label="重试" size="small" icon="pi pi-refresh" @click="renderErr = ''" />
+            <Button label="刷新页面" size="small" severity="secondary" icon="pi pi-sync" @click="reloadPage()" />
+          </div>
+        </div>
+        <template v-else>
+        <!-- 2026-09-22 用户：任何页面加载失败都不能静默（此前失败被伪装成「暂无数据」）——全局横幅覆盖所有视图 -->
+        <div v-if="store.loadError" class="load-error-banner">
+          <i class="pi pi-exclamation-triangle" aria-hidden="true"></i>
+          <span>加载失败：{{ store.loadError }}</span>
+          <Button label="重试" size="small" text icon="pi pi-refresh" @click="load()" />
+        </div>
         <Transition name="view-fade" mode="out-in">
           <FeedView v-if="store.view === 'feed'" key="feed" />
           <FriendsView v-else-if="store.view === 'friends'" key="friends" />
@@ -198,9 +253,11 @@ async function refresh() {
           <WeeklyReportView v-else-if="store.view === 'report'" key="report" />
           <ModerationView v-else-if="store.view === 'moderation'" key="moderation" />
           <ToolsView v-else-if="store.view === 'tools'" key="tools" />
+          <SettingsView v-else-if="store.view === 'settings'" key="settings" />
           <OpenView v-else-if="store.view === 'open'" key="open" />
           <PlaceholderView v-else :view="store.view" key="placeholder" />
         </Transition>
+        </template>
       </main>
 
       <aside v-if="!store.isMobile" class="rightbar">
@@ -268,6 +325,21 @@ async function refresh() {
 </template>
 
 <style scoped>
+.load-error-banner {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 8px 12px 0;
+  padding: 8px 12px;
+  border: 1px solid var(--border-soft);
+  border-left: 3px solid #e5484d;
+  border-radius: 6px;
+  background: var(--surface-2);
+  color: var(--text);
+  font-size: 13px;
+}
+.load-error-banner i { color: #e5484d; }
+.load-error-banner span { flex: 1; }
 .header-bell-dot { position: absolute; top: 2px; right: 2px; min-width: 16px; height: 16px; padding: 0 4px; border-radius: 8px; background: var(--danger); color: #fff; font-size: 9px; font-weight: 700; line-height: 16px; text-align: center; box-sizing: border-box; }
 .to-top { position: fixed; right: 18px; bottom: 76px; z-index: 50; width: 38px; height: 38px; border-radius: 50%; border: 1px solid var(--border); background: var(--surface-3); color: var(--text); cursor: pointer; display: flex; align-items: center; justify-content: center; box-shadow: 0 4px 14px rgba(0,0,0,0.35); transition: transform 0.12s, border-color 0.12s; }
 .to-top:hover { border-color: var(--accent); transform: translateY(-1px); }
@@ -279,4 +351,11 @@ async function refresh() {
 .drawer-group:first-child { margin-top: 0; }
 /* 移动端好友抽屉：RightBar 撑满并内部滚动（rb-inner 自带 height:100% + overflow-y:auto） */
 :deep(.friends-drawer .p-drawer-content) { padding: 0; overflow: hidden; }
+/* 首次进入时的鉴权裸探测占位（issue #213）：未启用鉴权时一闪而过，启用时过渡到登录门 */
+.auth-probe { min-height: 100vh; display: flex; align-items: center; justify-content: center; gap: 8px; color: var(--text-dim); font-size: 13px; }
+
+.render-err { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 8px; padding: 40px 16px; color: var(--text); text-align: center; }
+.render-err i { font-size: 26px; color: #e5484d; }
+.render-err small { color: var(--text-dim); max-width: 560px; word-break: break-word; }
+.render-err-actions { display: flex; gap: 8px; margin-top: 6px; }
 </style>

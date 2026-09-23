@@ -10,7 +10,42 @@
  * 纯搬移重构：服务名、owner、实现逐字节一致，无行为变更。
  */
 import { isSafeModeEnabled } from './safe-mode.js';
+import { getLogger } from './logger.js';   // 2026-09-22 评审 ⚠️1：新增的外部调用点必须逐分支留痕（不许 console.log 绕过 VRC_MONITOR_LOGGER_*）
+const log = getLogger('dashboard');
+import { resolveSelfPresence } from './self-presence.js';
+
+// 世界缓存新鲜度（2026-09-15 新增，env 可配）：world_cache 里的名字/描述/标签是**快照**，
+// 世界作者改名后不会自动变（实测 Idle Merchant 掛機商人 V0.1.4 → V0.3.1 停了 11 天）。
+// 超期即触发一次后台回源刷新（走 dashboard.world，内部限流 + 10s 超时）。
+const WORLD_CACHE_TTL_DAYS = Math.max(1, Number(process.env.VRC_MONITOR_WORLD_CACHE_TTL_DAYS) || 7);
+const WORLD_CACHE_TTL_MS = WORLD_CACHE_TTL_DAYS * 24 * 60 * 60 * 1000;
+// 失败冷却（审查 💡1）：与新鲜度阈值**解耦**——用 7 天 TTL 当冷却会让一次瞬时失败
+// （网络抖动/限流/超时）把展示名停在旧值最多 7 天（旧行为「每请求重试」顺带的自愈没了）。
+// 30 分钟足够压住「不可见世界每 ~2 分钟被重试」的配额浪费，又保留快速自愈。
+// 可配（审查 💡）：VRC_MONITOR_WORLD_FETCH_COOLDOWN_MS——非法值/0/负回落到 30 分钟；
+// 正数 <60s 钳到 60s（最小下限）。注意：负值走 Math.max 会被钳到 60s 而非回落默认
+// （方向=最激进重试，与冷却意图相反），故显式区分。
+const WORLD_FETCH_COOLDOWN_RAW = Number(process.env.VRC_MONITOR_WORLD_FETCH_COOLDOWN_MS);
+const WORLD_FETCH_COOLDOWN_MS = Number.isFinite(WORLD_FETCH_COOLDOWN_RAW) && WORLD_FETCH_COOLDOWN_RAW > 0
+  ? Math.max(60 * 1000, WORLD_FETCH_COOLDOWN_RAW)
+  : 30 * 60 * 1000;
+// 回源失败冷却（2026-09-15 审查 💡1）：dashboard.world 失败时不写占位 → 若不做冷却，
+// 一个永久 404/不可见的世界会在每次 friends 请求里被反复回源（前端 120s 轮询 → 最坏每 ~2 分钟一次）。
+// 内存 Map 即可（重启即重置 → 重试一次，可接受）；无 schema 变更。
+const worldFetchCooldown = new Map(); // worldId -> lastAttemptAt
+
+// world_cache.updated_at 由 SQLite datetime('now') 写入（UTC、无时区后缀）→ 补 Z 再解析。
+// 注意（审查 💡2）：updated_at 是「行被写过」的时间，setWorldNote/setWorldFavorited 也会刷新它而
+// 不动 name——所以拿它当新鲜度阈值是**近似值**（会写备注/收藏的世界往往刚玩过、名字本就新，
+// 影响小），不要据它推断「名字必然新鲜」。
+function worldCacheStale(updatedAt) {
+  if (!updatedAt) return true;
+  const t = Date.parse(String(updatedAt).replace(' ', 'T') + (String(updatedAt).endsWith('Z') ? '' : 'Z'));
+  if (Number.isNaN(t)) return true;
+  return Date.now() - t >= WORLD_CACHE_TTL_MS;
+}
 import { imgProxy, avatarThumb, avatarOf, avatarFileId } from './img-util.js';
+import { handleGetFriendWorldStats } from './tools/events.js';
 
 // 通知类型→中文标签（与前端 ui/src/utils.js 的 notificationTypeLabels 对齐，供 see/hide-notification 摘要拼类型）。
 // 通知相关事件 content 可能携带 notificationType / updateType / type 之一；历史遗留也可能是裸字符串 ID，
@@ -88,7 +123,7 @@ export function registerDashboardServices(loader, ctx) {
   }
   loader.services.set('dashboard.friends', ({ limit = 100 } = {}) => {
     const rows = ctx.storage.query(`SELECT f.user_id AS userId, f.display_name AS displayName, f.is_online AS isOnline,
-      f.location, f.world_id AS worldId, COALESCE(NULLIF(f.world_name,''), wc.name, '') AS worldName, wc.image_url AS worldImageUrl,
+      f.location, f.world_id AS worldId, COALESCE(NULLIF(wc.name,''), f.world_name, '') AS worldName, wc.image_url AS worldImageUrl, wc.updated_at AS worldCacheUpdatedAt,
       f.platform, f.status, f.status_description AS statusDescription, f.bio, f.pronouns,
       f.trust_level AS trustLevel, f.memo, f.avatar_image_url AS avatarUrl, f.user_icon AS userIcon,
       f.last_seen AS lastSeen, f.last_online AS lastOnline, f.last_offline AS lastOffline
@@ -98,10 +133,13 @@ export function registerDashboardServices(loader, ctx) {
     // 「最近一起玩」按历史同屏聚合（与在线状态无关），排序靠后的好友此前被前 100/200 截断
     // → 点开误判「非好友」，共同好友/群组/世界/模型信息丢失。
     { $limit: Math.min(Math.max(Number(limit) || 100, 1), 1000) });
-    // 后台预热：在线好友所在世界缺缓存时拉取填充 world_cache（限流+10s 超时，不阻塞响应；
-    // 填充后下次请求 worldName/worldImageUrl 即有值，右侧栏显示世界名+头图）
+    // 后台预热：在线好友所在世界**缺缓存**或**缓存过期**（超过 VRC_MONITOR_WORLD_CACHE_TTL_DAYS）
+    // 时拉取刷新 world_cache（限流+10s 超时，不阻塞响应；填充/刷新后下次请求 worldName 即为新值——
+    // 这是「世界改名后本服务能跟上」的关键路径，原先只处理缺名，导致有名字的旧缓存永不更新）
     try {
-      const missing = rows.filter((r) => r.isOnline && r.worldId && String(r.worldId).startsWith('wrld_') && !r.worldName);
+      const missing = rows.filter((r) => r.isOnline && r.worldId && String(r.worldId).startsWith('wrld_')
+        && (!r.worldName || worldCacheStale(r.worldCacheUpdatedAt))
+        && (!worldFetchCooldown.has(r.worldId) || Date.now() - worldFetchCooldown.get(r.worldId) >= WORLD_FETCH_COOLDOWN_MS));
       if (missing.length) {
         const worldSvc = loader.services.get('dashboard.world');
         (async () => {
@@ -119,7 +157,7 @@ export function registerDashboardServices(loader, ctx) {
     const since = new Date(Date.now() - Number(days || 7) * 86400000).toISOString();
     // 取全部 user-location（含离开/传送 world_id=''），用 location 切分会话：
     // 进入世界（wrld_xxx:instance）→ 开新段；离开/传送（traveling/offline/空）→ 结束当前段
-    const rows = ctx.storage.query(`SELECT e.world_id AS worldId, COALESCE(NULLIF(e.world_name,''), wc.name, '') AS worldName, e.created_at AS createdAt, e.content_json AS content
+    const rows = ctx.storage.query(`SELECT e.world_id AS worldId, COALESCE(NULLIF(wc.name,''), e.world_name, '') AS worldName, e.created_at AS createdAt, e.content_json AS content
       FROM events e LEFT JOIN world_cache wc ON wc.world_id = e.world_id
       WHERE e.type = 'user-location' AND e.created_at >= $since
       ORDER BY e.created_at ASC`, { $since: since });
@@ -180,31 +218,25 @@ export function registerDashboardServices(loader, ctx) {
   // null（无法判定——无 selfId/无 user-location 记录/异常）。
   // 护栏：WS 断链期间收不到 offline 推送，最近一条在线记录超过 1 小时无新事件时
   // 视为"可能仍在线"返回 null，由调用方保守推迟刷新（宁可晚刷不在可能在线时刷）。
+  // 判定实现统一在 core/self-presence.js（与 dashboard.selfPresence 共用，本服务只是三态→三值的薄映射）。
   loader.services.set('dashboard.isSelfOnline', () => {
     try {
-      const selfId = getSelfUserId(ctx.storage);
-      if (!selfId) return null;
-      const row = ctx.storage.query(
-        `SELECT content_json, created_at FROM events WHERE type='user-location' AND user_id = $self ORDER BY created_at DESC LIMIT 1`,
-        { $self: selfId }
-      )[0];
-      if (!row) return null;
-      let loc = '';
-      try { loc = (JSON.parse(row.content_json || '{}').location) || ''; } catch { return null; }
-      // 明确离线/空 → false；其余任何 location 都视为"可能在线"（VRChat 在线时 location 可能是
-      // private/friends/group/local/traveling/wrld_ 等，其中 private/friends/group/local 可为"无 worldId 独立值"，
-      // 见 parseLocInfo 实例段解析）。绝不把在线状态误判为离线去触发重挖。
-      if (loc === 'offline' || loc === 'offline:offline' || loc === '') return false;
-      // 可确认的在线形式 + 新鲜度护栏 → true；无法确认/陈旧 → null（调用方保守推迟刷新）
-      if (loc.startsWith('wrld_') || loc === 'traveling' || /^(private|friends|group|local)\b/.test(loc)) {
-        const at = Date.parse(row.created_at);
-        if (!Number.isFinite(at) || Date.now() - at > 60 * 60 * 1000) return null;
-        return true;
-      }
+      const presence = resolveSelfPresence(ctx.storage, { selfId: getSelfUserId(ctx.storage) });
+      if (presence.state === 'in_game') return true;
+      if (presence.state === 'not_in_game') return false;
       return null;
     } catch { return null; }
   });
   loader.serviceOwners.set('dashboard.isSelfOnline', 'core');
+
+  // 自己的在场状态三态（in_game / not_in_game / unknown），带位置、时间与新鲜度，
+  // 供插件区分"在游戏内"与"只在网页端在线"（服务常驻登录时自己的 location 恒为
+  // offline:offline）——例如 presence-status 插件据此切换自定义状态描述。
+  // 语义与不变量见 core/self-presence.js 头部说明。
+  loader.services.set('dashboard.selfPresence', () =>
+    resolveSelfPresence(ctx.storage, { selfId: getSelfUserId(ctx.storage) }));
+  loader.serviceOwners.set('dashboard.selfPresence', 'core');
+
 
   // 动态数据时间范围（最早/最新事件日期）：日历筛选的可选范围（VRCX 对齐）
   loader.services.set('dashboard.eventsRange', () => {
@@ -214,6 +246,28 @@ export function registerDashboardServices(loader, ctx) {
     } catch { return { min: null, max: null }; }
   });
   loader.serviceOwners.set('dashboard.eventsRange', 'core');
+
+  // 「最近一张已知头像」按 userId 进程内缓存（含负缓存：无图的用户 6 小时内不重复查库 ✓）
+  // —— 用于 status/bio 这类 WS 未带图的 profile 事件，避免行内头像空白（2026-09-22 用户报障 ✓）
+  const _lastAvatarCache = new Map();
+  const lastKnownAvatarUrl = (userId) => {
+    if (!userId) return '';
+    const hit = _lastAvatarCache.get(userId);
+    if (hit && hit.until > Date.now()) return hit.url;
+    let url = '';
+    try {
+      const r = ctx.storage.query(
+        `SELECT content_json AS c FROM events WHERE user_id = $u`
+        + ` AND json_extract(content_json,'$.avatarImageUrl') <> ''`
+        + ` ORDER BY created_at DESC LIMIT 1`, { $u: userId })[0];
+      if (r) {
+        let c = {}; try { c = JSON.parse(r.c); } catch { /* ignore */ }
+        url = imgProxy(avatarThumb(c.avatarImageUrl) || '');
+      }
+    } catch { /* 查询失败按无图处理 */ }
+    _lastAvatarCache.set(userId, { url, until: Date.now() + (url ? 6 * 3600 * 1000 : 30 * 60 * 1000) });
+    return url;
+  };
 
   loader.services.set('dashboard.events', async ({ limit = 50, offset = 0, dateFrom = '', dateTo = '' } = {}) => {
     // 日期范围过滤（VRCX 式日历范围选择）：只查首尾范围内的数据，分页也按范围
@@ -227,7 +281,7 @@ export function registerDashboardServices(loader, ctx) {
     const where = conds.length ? 'WHERE ' + conds.join(' AND ') : '';
     const rows = ctx.storage.query(`SELECT e.*, f.display_name AS friendDisplayName,
       f.avatar_image_url AS avatarUrl, f.user_icon AS userIcon, f.trust_level AS trustLevel,
-      COALESCE(NULLIF(e.world_name,''), wc.name, '') AS world_name,
+      COALESCE(NULLIF(wc.name,''), e.world_name, '') AS world_name,
       wc.image_url AS world_image_url
       FROM events e LEFT JOIN friends f ON f.user_id = e.user_id
       LEFT JOIN world_cache wc ON wc.world_id = e.world_id
@@ -380,7 +434,7 @@ export function registerDashboardServices(loader, ctx) {
           : row.type === 'friend-update' ? ({ avatar: '更换模型', status: '状态变化', bio: '简介变化', user_icon: '更新头像图标', pronouns: '更新代词' }[content.type] || '资料变化')
           : row.type === 'friend-online' ? '上线'
           : row.type === 'friend-offline' ? (content.reconcile ? '掉线期间离线' : '离线')
-          : row.type === 'friend-active' ? '状态变化'
+          : row.type === 'friend-active' ? (content.platform === 'web' ? '转网页端在线' : content.platform === 'nativemobile' ? '转App在线' : '状态变化')
           : row.type === 'notification' || row.type === 'notification-v2' ? (content.message || content.title || '通知')
           : row.type === 'notification-v2-update' || row.type === 'notification-update' ? (content.updates && content.updates.seen ? '通知已读' : '通知状态更新')
           : row.type === 'user-update' ? ({ status: '状态变化', bio: '简介变化', avatar: '更换模型', user_icon: '更新头像图标' }[content.type] || '资料变化')
@@ -405,10 +459,12 @@ export function registerDashboardServices(loader, ctx) {
         previousAvatarName: content.previousAvatarName || '',
         // avatarId 富化：WS 推送不含 currentAvatar，从 planet_cache 的 imageUrl→avatarId 映射反查（_syncFriendAvatars 建立）
         avatarId: content.avatarId || user.currentAvatar || (() => {
-          const fm = String(content.avatarImageUrl || '').match(/\/file\/(file_[a-f0-9-]+)/);
+          // 2026-09-22 #225：收敛到 avatarFileId()（原内联正则只认 /file/ ✗）
+          // 2026-09-22 评审纠正：avatarFileId() 返回**字符串**（不是正则 match 数组）✗
+          const fm = avatarFileId(content.avatarImageUrl) || '';
           if (!fm) return '';
           try {
-            const avr = ctx.storage.query(`SELECT payload FROM planet_cache WHERE key = $k`, { $k: `avimg:${fm[1]}` });
+            const avr = ctx.storage.query(`SELECT payload FROM planet_cache WHERE key = $k`, { $k: `avimg:${fm}` });
             if (avr[0]) { const v = JSON.parse(avr[0].payload); if (v && v.avatarId) return v.avatarId; }
           } catch { /* ignore */ }
           return '';
@@ -420,6 +476,14 @@ export function registerDashboardServices(loader, ctx) {
         bio: content.bio || user.bio || '',
         previousBio: content.previousBio || '',
         userIcon: imgProxy(content.userIcon || user.userIcon || ''),
+        // 2026-09-22 用户报障「为什么会有没头像的（散华ln 非好友）」——实测：该用户 status 事件的载荷里
+        // `avatarImageUrl` **就是空串** ✗（WS 没带图），所以本块即使拼了 avatarUrl 也不会有图 ✓。
+        // 正解：回退到「该 userId **最近一次带图的事件**」（数据就在 events 表里 ✓ 不需要发 API ✓），带进程内缓存 + 负缓存 ✓。
+        // 2026-09-22 用户报障「为什么会有没头像的（散华ln 非好友，半天也不加载）」：
+        // 本块（profile 变更）**此前没有 avatarUrl** ✗，而前端 playerAvatarOf 优先读 avatarUrl ⇒ 非好友行头像空白 ✓。
+        // 数据其实就在事件载荷里（status 事件自带 avatarImageUrl ✓）—— 不是「没加载」，是没被拼进去 ✓。
+        avatarUrl: avatarOf(row.userIcon || user.userIcon, row.avatarUrl || content.avatarImageUrl || user.currentAvatarImageUrl)
+          || lastKnownAvatarUrl(row.user_id),
         previousUserIcon: content.previousUserIcon || '',
         pronouns: content.pronouns || user.pronouns || '',
         previousPronouns: content.previousPronouns || '',
@@ -450,10 +514,21 @@ export function registerDashboardServices(loader, ctx) {
         const rows = ctx.storage.query(`SELECT key, payload FROM planet_cache WHERE key LIKE 'avatar_name:%'`);
         for (const r of rows) {
           const fid = String(r.key).slice('avatar_name:'.length);
-          try { const v = JSON.parse(r.payload); if (v && v.name) anCache.set(fid, v.name); } catch { /* ignore */ }
+          try {
+            const v = JSON.parse(r.payload);
+            // 负缓存也要载入，否则每次翻页都会重试同一批不可解析的 fileId ✗
+            if (v && v.miss) { if (!v.until || v.until > Date.now()) anCache.set(fid, ''); }
+            else if (v && v.name) anCache.set(fid, v.name);
+          } catch { /* ignore */ }
         }
       } catch { /* 无表/查询失败则仅用内存缓存 */ }
     }
+    // 2026-09-22：补名**失败**时写负缓存（6 小时内不再重试同一 fileId）—— 深层页全是老数据，
+    // 其 fileId 多不可解析，若失败什么都不写就会每次翻页重试同一批 ⇒ 限流器被打爆（实测 40–105 秒等待/分钟）
+    const saveAvMiss = (fileId) => {
+      anCache.set(fileId, '');
+      try { ctx.storage.setPlanetCache(`avatar_name:${fileId}`, { name: '', miss: true, until: Date.now() + 6 * 3600 * 1000 }); } catch { /* 落盘失败不影响响应 */ }
+    };
     const saveAvName = (fileId, name) => {
       anCache.set(fileId, name);
       try { ctx.storage.setPlanetCache(`avatar_name:${fileId}`, { name, at: Date.now() }); } catch { /* 落盘失败不影响响应 */ }
@@ -530,8 +605,9 @@ export function registerDashboardServices(loader, ctx) {
           try {
             const a = await ctx.rateLimiter.execute(() => ctx.api._request('GET', `/file/${fileId}`));
             const nm = parseAvName(a && a.data && a.data.name);
-            if (nm) { ev[key] = nm; saveAvName(fileId, nm); }
-          } catch { /* 查询失败保留空名，下次再试 */ }
+            if (nm) { ev[key] = nm; saveAvName(fileId, nm); try { log.debug(`[模型名] 已解析 ${fileId.slice(0,20)}… → ${nm}`); } catch { /* 日志失败忽略 */ } }
+            else { log.info(`[模型名] 解析不出，落负缓存 6h：${fileId.slice(0,20)}…`); saveAvMiss(fileId); }   // 降级决策必须留痕 ✓
+          } catch (e) { log.warn('[模型名] 解析失败（保留空名，下次再试）：' + (e && e.message ? e.message : e)); }
         }
       })();
     }
@@ -581,8 +657,9 @@ export function registerDashboardServices(loader, ctx) {
         createdAt: row.created_at,
         worldId: row.world_id || content.worldId || world.id || '',
         worldName: row.world_name || world.name || '',
-        avatarUrl: avatarOf(friend?.userIcon, friend?.avatarUrl),
-        summary: row.type === 'friend-location' ? '位置变化' : row.type === 'friend-online' ? '上线' : row.type === 'friend-offline' ? '离线' : row.type === 'friend-active' ? '状态变化' : row.type === 'friend-update' ? ({ avatar: '更换模型', status: '状态变化', bio: '简介变化', user_icon: '更新头像图标', pronouns: '更新代词', displayName: '改名' }[content.type] || '资料变化') : row.type === 'notification' || row.type === 'notification-v2' ? (content.message || content.title || '通知') : row.type === 'notification-v2-update' || row.type === 'notification-update' ? (content.updates && content.updates.seen ? '通知已读' : '通知状态更新') : row.type === 'user-update' ? ({ status: '状态变化', bio: '简介变化', avatar: '更换模型', user_icon: '更新头像图标', pronouns: '更新代词', displayName: '改名' }[content.type] || '资料变化') : row.type === 'user-location' ? '我的位置变化' : row.type === 'friend-add' ? '新增好友' : row.type === 'friend-delete' ? '已解除好友' : row.type === 'content-refresh' ? ('内容库：' + (content.actionType === 'add' ? '获得' : content.actionType === 'delete' ? '移除' : content.actionType || '更新') + ({ prop: '道具', bundle: '捆绑包' }[content.itemType] || content.itemType || '物品')) : row.type === 'group-joined' ? '加入群组' : row.type === 'group-member-updated' ? '群组成员信息更新' : row.type === 'group-role-updated' ? '群组角色更新' : row.type === 'hide-notification' ? ('通知已隐藏' + ((notificationTypeLabel(notiSrc) || notificationTypeLabel(content)) ? '：' + (notificationTypeLabel(notiSrc) || notificationTypeLabel(content)) + (notiSrc.senderUsername ? '（' + notiSrc.senderUsername + '）' : '') : '')) : row.type === 'see-notification' ? ('通知已读' + ((notificationTypeLabel(notiSrc) || notificationTypeLabel(content)) ? '：' + (notificationTypeLabel(notiSrc) || notificationTypeLabel(content)) + (notiSrc.senderUsername ? '（' + notiSrc.senderUsername + '）' : '') : '')) : row.type === 'unknown' ? '未知事件' : '未分类事件: ' + row.type,
+        // 非好友时 friend 为空 ⇒ 头像会空 ✗，回退到该用户最近一次带图的事件 ✓
+        avatarUrl: avatarOf(friend?.userIcon, friend?.avatarUrl) || lastKnownAvatarUrl(userId),
+        summary: row.type === 'friend-location' ? '位置变化' : row.type === 'friend-online' ? '上线' : row.type === 'friend-offline' ? '离线' : row.type === 'friend-active' ? (content.platform === 'web' ? '转网页端在线' : content.platform === 'nativemobile' ? '转App在线' : '状态变化') : row.type === 'friend-update' ? ({ avatar: '更换模型', status: '状态变化', bio: '简介变化', user_icon: '更新头像图标', pronouns: '更新代词', displayName: '改名' }[content.type] || '资料变化') : row.type === 'notification' || row.type === 'notification-v2' ? (content.message || content.title || '通知') : row.type === 'notification-v2-update' || row.type === 'notification-update' ? (content.updates && content.updates.seen ? '通知已读' : '通知状态更新') : row.type === 'user-update' ? ({ status: '状态变化', bio: '简介变化', avatar: '更换模型', user_icon: '更新头像图标', pronouns: '更新代词', displayName: '改名' }[content.type] || '资料变化') : row.type === 'user-location' ? '我的位置变化' : row.type === 'friend-add' ? '新增好友' : row.type === 'friend-delete' ? '已解除好友' : row.type === 'content-refresh' ? ('内容库：' + (content.actionType === 'add' ? '获得' : content.actionType === 'delete' ? '移除' : content.actionType || '更新') + ({ prop: '道具', bundle: '捆绑包' }[content.itemType] || content.itemType || '物品')) : row.type === 'group-joined' ? '加入群组' : row.type === 'group-member-updated' ? '群组成员信息更新' : row.type === 'group-role-updated' ? '群组角色更新' : row.type === 'hide-notification' ? ('通知已隐藏' + ((notificationTypeLabel(notiSrc) || notificationTypeLabel(content)) ? '：' + (notificationTypeLabel(notiSrc) || notificationTypeLabel(content)) + (notiSrc.senderUsername ? '（' + notiSrc.senderUsername + '）' : '') : '')) : row.type === 'see-notification' ? ('通知已读' + ((notificationTypeLabel(notiSrc) || notificationTypeLabel(content)) ? '：' + (notificationTypeLabel(notiSrc) || notificationTypeLabel(content)) + (notiSrc.senderUsername ? '（' + notiSrc.senderUsername + '）' : '') : '')) : row.type === 'unknown' ? '未知事件' : '未分类事件: ' + row.type,
       };
     });
   });
@@ -592,7 +669,7 @@ export function registerDashboardServices(loader, ctx) {
   loader.services.set('dashboard.recentWorlds', ({ limit = 12 } = {}) => {
     const l = Math.min(Math.max(Number(limit) || 12, 1), 60);
     const worlds = ctx.storage.query(`SELECT e.world_id AS worldId,
-        COALESCE(NULLIF(e.world_name,''), wc.name, '') AS worldName,
+        COALESCE(NULLIF(wc.name,''), e.world_name, '') AS worldName,
         wc.image_url AS imageUrl,
         wc.favorited AS favorited,
         MAX(wc.note) AS note,
@@ -630,6 +707,31 @@ export function registerDashboardServices(loader, ctx) {
       }
     }
     if (cur) { cur.end = cur.lastSeen; addMin(cur); }
+    // 补名：world_cache 无记录（事件与缓存皆无名字）的世界，fire-and-forget 走 dashboard.world
+    // （自带限流+10s 超时+upsert 缓存）拉取资料落库——本次响应不阻塞，下次查询即有名字。
+    // 触发频率受限：仅 world_cache 无记录、或空名占位已超 TTL 的世界触发；补名失败（404/私有/
+    // 不可见/瞬时超时）时 upsert 空名占位（负缓存，updated_at 刷新）走 emptyWorldIds 既有冷却
+    // 机制——TTL（24h）内不再对同一世界重复发起 API 尝试，超时自动放行一次重试（瞬时失败可自愈）。
+    const worldSvc = loader.services.get('dashboard.world');
+    const EMPTY_PLACEHOLDER_TTL_MS = 24 * 60 * 60 * 1000;
+    for (const w of worlds) {
+      if (!w.worldName && String(w.worldId).startsWith('wrld_') && worldSvc) {
+        const cached = ctx.storage.getWorldName(w.worldId);
+        let placeholderAge = NaN;
+        if (cached && !cached.name) {
+          // updated_at 为 SQLite datetime('now')（UTC 无时区串），补 Z 按 UTC 解析
+          placeholderAge = Date.now() - Date.parse(String(cached.updated_at || '').replace(' ', 'T') + 'Z');
+        }
+        const placeholderExpired = cached && !cached.name && (Number.isNaN(placeholderAge) || placeholderAge >= EMPTY_PLACEHOLDER_TTL_MS);
+        if (!cached || placeholderExpired) {
+          Promise.resolve(worldSvc({ worldId: w.worldId }))
+            .then((r) => {
+              if (!r || !r.name) ctx.storage.upsertWorld({ worldId: w.worldId, name: '' }); // 不可见/失败 → 空名占位（负缓存）
+            })
+            .catch(() => { /* 补名失败静默 */ });
+        }
+      }
+    }
     return worlds.map((w) => ({ ...w, visits: segCount.get(w.worldId) || 0, minutes: minutes.get(w.worldId) || 0 }));  // 保持数组契约（路由层再包 {worlds: [...]}）；visits 统一为进入段数
   });
   loader.serviceOwners.set('dashboard.recentWorlds', 'core');
@@ -707,6 +809,8 @@ export function registerDashboardServices(loader, ctx) {
             groupName,
             title: annTitle,
             text: content.message || '',
+            // 公告封面图：content 顶层 imageUrl（notification-v2 群公告实测字段），经本地代理
+            imageUrl: imgProxy(content.imageUrl || (content.data && content.data.imageUrl) || ''),
           };
         }),
       };
@@ -729,15 +833,21 @@ export function registerDashboardServices(loader, ctx) {
     try {
       const rows = ctx.storage.query(
         `SELECT t.user_id AS userId, t.display_name AS displayName, t.avatar_image_url AS avatarUrl,
-                t.status, t.status_description AS statusDescription, t.location,
+                t.status, t.status_description AS statusDescription, t.location, t.memo, t.trust_level AS trustLevel,   -- 2026-09-22：SELECT 是显式清单 ⇒ 新列必须显式加 ✗
                 t.added_at AS addedAt, t.last_refresh_at AS lastRefreshAt,
                 (SELECT e.created_at FROM events e
                   WHERE e.user_id = t.user_id AND e.type = 'friend-update' AND e.source = 'poll'
                   ORDER BY e.id DESC LIMIT 1) AS lastChangeAt
-         FROM tracked_non_friends t WHERE t.removed_at = '' ORDER BY t.last_refresh_at DESC, t.added_at DESC LIMIT $limit`,
+         FROM tracked_non_friends t
+         -- 权威源兜底(#164 补漏):列表只含"当前非好友"。friend-add 联动写 removed_at 是事件驱动,
+         -- 事件丢失(停机/断连窗口内加好友)会残留;LEFT JOIN friends 排除,若日后解除好友自动回列。
+         LEFT JOIN friends f ON f.user_id = t.user_id
+         WHERE t.removed_at = '' AND f.user_id IS NULL
+         ORDER BY t.last_refresh_at DESC, t.added_at DESC LIMIT $limit`,
         { $limit: Math.min(Math.max(Number(limit) || 200, 1), 500) });
       const selfId = getSelfUserId(ctx.storage);
-      return { tracked: rows.filter((r) => r.userId !== selfId).map((r) => ({ ...r, avatarUrl: avatarThumb(r.avatarUrl) || '' })) };
+      // 2026-09-22 用户报障「非好友追踪页全是大写首字母」：追踪表的 avatarUrl 常常是空的 ⇒ 回退到该用户最近一次带图的事件 ✓
+      return { tracked: rows.filter((r) => r.userId !== selfId).map((r) => ({ ...r, trustLevel: r.trustLevel || '', avatarUrl: avatarThumb(r.avatarUrl) || lastKnownAvatarUrl(r.userId) || '' })) };
     } catch {
       return { tracked: [] };
     }
@@ -758,7 +868,7 @@ export function registerDashboardServices(loader, ctx) {
       `INSERT OR IGNORE INTO tracked_non_friends (user_id, display_name) VALUES ($u, $d)`,
       { $u: userId, $d: dn });
     // 重新添加：清除移除标记（若是历史移除过的用户）
-    ctx.storage.run(`UPDATE tracked_non_friends SET removed_at = '' WHERE user_id = $u`, { $u: userId });
+    ctx.storage.run(`UPDATE tracked_non_friends SET removed_at = '', fail_count = 0 WHERE user_id = $u`, { $u: userId });
     const added = !existing.length;
     return { ok: true, added, userId, displayName: dn };
   });
@@ -775,6 +885,77 @@ export function registerDashboardServices(loader, ctx) {
     return { ok: true, removed: r.changes > 0, userId };
   });
   loader.serviceOwners.set('dashboard.trackedRemove', 'core');
+
+  // 备注非好友（自由文本，≤200 字符；空串=清除）。本地可恢复操作，无 safe-mode 拦截。
+  loader.services.set('dashboard.trackedMemo', ({ userId, memo } = {}) => {
+    if (typeof userId !== 'string' || !userId.startsWith('usr_')) {
+      throw new Error('userId 必须是 usr_ 开头的用户 ID');
+    }
+    // 码点级截断（review #173：UTF-16 slice 会把 emoji 切半成 U+FFFD）
+    const chars = Array.from(String(memo ?? '').trim());
+    const m = chars.length <= 200 ? chars.join('') : chars.slice(0, 200).join('');
+    const r = ctx.storage.run(
+      `UPDATE tracked_non_friends SET memo = $m WHERE user_id = $u AND removed_at = ''`,
+      { $m: m, $u: userId });
+    return { ok: true, updated: r.changes > 0, userId, memo: m };
+  });
+  loader.serviceOwners.set('dashboard.trackedMemo', 'core');
+
+  // VRChat 官方活动日历（/calendar 三态：全部/精选/关注的群组活动；2026-09-10 探测验证可用）
+  // 新分页风格：{ hasNext, results, totalCount }。只读探测，8s 竞速超时，失败降级空列表。
+  loader.services.set('dashboard.calendar', async ({ scope = 'all', n = 30, offset = 0 } = {}) => {
+    if (!ctx.api) return { events: [], hasNext: false, totalCount: null };
+    const lim = Math.min(Math.max(Number(n) || 30, 1), 50);
+    const off = Math.max(Number(offset) || 0, 0);
+    const suffix = off ? `&offset=${off}` : '';
+    const p = scope === 'featured' ? `/calendar/featured?n=${lim}${suffix}`
+      : scope === 'following' ? `/calendar/following?n=${lim}${suffix}`
+      : `/calendar?n=${lim}${suffix}`;
+    try {
+      const r = await Promise.race([
+        ctx.api._request('GET', p),
+        new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 8000)),
+      ]);
+      const d = r.data || {};
+      const list = Array.isArray(d.results) ? d.results : [];
+      return {
+        events: list.map((e) => ({
+          id: e.id, title: e.title || '', category: e.category || '',
+          description: (e.description || '').slice(0, 600),
+          startsAt: e.startsAt || '', endsAt: e.endsAt || '',
+          featured: !!e.featured, interestedUserCount: e.interestedUserCount ?? null,
+          ownerId: e.ownerId || null, accessType: e.accessType || '',
+          imageUrl: e.imageUrl ? imgProxy(e.imageUrl) : '',
+        })),
+        hasNext: !!d.hasNext, totalCount: d.totalCount ?? null,
+      };
+    } catch { return { events: [], hasNext: false, totalCount: null }; }
+  });
+  loader.serviceOwners.set('dashboard.calendar', 'core');
+  // 群组帖子（/groups/{gid}/posts：群组通知/公告类帖子流；2026-09-10 探测验证可用）
+  loader.services.set('dashboard.groupPosts', async ({ groupId, n = 20, offset = 0 } = {}) => {
+    if (typeof groupId !== 'string' || !groupId.startsWith('grp_')) throw new Error('groupId 必须是 grp_ 开头的群组 ID');
+    if (!ctx.api) return { posts: [], total: null };
+    const lim = Math.min(Math.max(Number(n) || 20, 1), 50);
+    const off = Math.max(Number(offset) || 0, 0);
+    const suffix = off ? `&offset=${off}` : '';
+    try {
+      const r = await Promise.race([
+        ctx.api._request('GET', `/groups/${groupId}/posts?n=${lim}${suffix}`),
+        new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 8000)),
+      ]);
+      const d = r.data || {};
+      return {
+        posts: (Array.isArray(d.posts) ? d.posts : []).map((p) => ({
+          id: p.id, title: p.title || '', text: (p.text || '').slice(0, 800),
+          authorId: p.authorId || null, createdAt: p.createdAt || '', updatedAt: p.updatedAt || '',
+          imageUrl: p.imageUrl ? imgProxy(p.imageUrl) : null, visibility: p.visibility || '',
+        })),
+        total: d.total ?? null,
+      };
+    } catch (e) { throw new Error(`群组帖子获取失败: ${String(e.message || e).slice(0, 60)}`); }
+  });
+  loader.serviceOwners.set('dashboard.groupPosts', 'core');
 
   // 非好友资料变化历史：start-monitor.js _recordNonFriendChange 把 bio/status 变化写成
   // friend-update 事件（content.type=bio/status，含 previousX 对比，source=poll）——此处只读查询展示
@@ -801,6 +982,10 @@ export function registerDashboardServices(loader, ctx) {
             previousStatus: c.previousStatus || '',
             previousStatusDescription: c.previousStatusDescription || '',
             avatarImageUrl: c.avatarImageUrl ? avatarThumb(c.avatarImageUrl) : '',
+            location: c.location || '',
+            previousLocation: c.previousLocation || '',
+            worldId: c.worldId || '',
+            worldName: c.worldName || '',
             previousAvatarImageUrl: c.previousAvatarImageUrl ? avatarThumb(c.previousAvatarImageUrl) : '',
           };
         }),
@@ -901,6 +1086,7 @@ export function registerDashboardServices(loader, ctx) {
           return pick(w);
         }
       } catch { /* 超时/失败返回 null，由调用方回退缓存或占位 */ }
+      worldFetchCooldown.set(worldId, Date.now());   // 失败冷却（💡1），避免每请求重试一个不可见世界
       return null;
     };
     const cached = ctx.storage.getWorldName(worldId);
@@ -1105,21 +1291,20 @@ export function registerDashboardServices(loader, ctx) {
       } catch { return null; }
     };
     const uid = encodeURIComponent(userId);
-    let user, friendsList, groups, worlds, avatars, favoriteWorlds;
+    let user, groups, worlds, avatars, favoriteWorlds;
     const cached = userProfileCache.get(userId);
     if (cached && Date.now() - cached.time < UP_TTL) {
-      ({ user, friendsList, groups, worlds, avatars, favoriteWorlds } = cached);
+      ({ user, groups, worlds, avatars, favoriteWorlds } = cached);
     } else {
       const selfId = (ctx.api && ctx.api.currentUser && ctx.api.currentUser.id) || '';
-      const [u, fl, g, w, av] = await Promise.all([
+      const [u, g, w, av] = await Promise.all([
         fetchApi(`/users/${uid}`),
-        fetchApi(`/users/${uid}/friends`),
         fetchApi(`/users/${uid}/groups`),
         fetchApi(`/worlds?userId=${uid}&n=50`),
         // 他人模型列表 VRChat 403（只能查自己）——跳过避免白等，弹窗仍可看群组/世界/共同好友
         userId === selfId ? fetchApi(`/avatars?userId=${uid}&n=50`) : Promise.resolve(null),
       ]);
-      user = u; friendsList = fl; groups = g; worlds = w; avatars = av;
+      user = u; groups = g; worlds = w; avatars = av;
       // 该用户的收藏世界（VRChat 公开收藏：/favorite/groups?ownerId + /worlds/favorites?ownerId&tag，VRCX 同款）
       favoriteWorlds = [];
       try {
@@ -1144,12 +1329,15 @@ export function registerDashboardServices(loader, ctx) {
           favoriteWorlds = (await Promise.all(groupTasks)).filter(Boolean);
         }
       } catch { favoriteWorlds = []; }
-      userProfileCache.set(userId, { time: Date.now(), user, friendsList, groups, worlds, avatars, favoriteWorlds });
+      userProfileCache.set(userId, { time: Date.now(), user, groups, worlds, avatars, favoriteWorlds });
     }
     // 共同好友：VRChat 专用端点 /users/{id}/mutuals/friends（服务器直接算共同好友，无需对方开启"共享好友列表"）
     // 旧实现用 /users/{id}/friends（对方全部好友）+ 本地交集，对方关闭共享时为空 → 共同好友不显示
     const mf = await fetchApi(`/users/${uid}/mutuals/friends`);
     const mutualFriends = Array.isArray(mf) ? mf : [];
+    // 共同群组：对称共同好友（/users/{id}/mutuals/groups，2026-09-10 探测验证可用）
+    const mg = await fetchApi(`/users/${uid}/mutuals/groups`).catch(() => null);
+    const mutualGroups = Array.isArray(mg) ? mg : [];
     // 本地统计（events 表）
     const q1 = (sql, p) => { try { return ctx.storage.query(sql, p); } catch { return []; } };
     const lastActivityRow = q1(`SELECT MAX(created_at) v FROM events WHERE user_id=$u`, { $u: userId })[0];
@@ -1193,12 +1381,13 @@ export function registerDashboardServices(loader, ctx) {
     // 模型名（currentAvatarImageUrl → file id → planet_cache avatar_name）
     let avatarName = '';
     try {
-      const fm = String(user && (user.currentAvatarImageUrl || user.currentAvatarThumbnailImageUrl) || '').match(/\/file\/(file_[a-f0-9-]+)/);
-      if (fm) {
+      // 2026-09-22 评审纠正：本处原来漏改（仍是旧正则 ✗）且条件里用了未绑定的 fid ✗ ⇒ ReferenceError 被 catch 吞掉 ⇒ 模型名恒空
+      const fid = avatarFileId(user && (user.currentAvatarImageUrl || user.currentAvatarThumbnailImageUrl || user.iconUrl) || '') || '';
+      if (fid) {   // 2026-09-22 #225：原为 if (fm) ✗ —— 非好友/无 avimg 映射时整段被跳过 ⇒ 好友详情模型名恒空 ✓
         const anCache = loader._avatarNameCache || (loader._avatarNameCache = new Map());
-        if (anCache.has(fm[1])) avatarName = anCache.get(fm[1]);
+        if (fid && anCache.has(fid)) avatarName = anCache.get(fid);
         else {
-          const ar = ctx.storage.query(`SELECT payload FROM planet_cache WHERE key=$k`, { $k: `avatar_name:${fm[1]}` })[0];
+          const ar = ctx.storage.query(`SELECT payload FROM planet_cache WHERE key=$k`, { $k: `avatar_name:${fid}` })[0];
           if (ar) { try { const v = JSON.parse(ar.payload); if (v && v.name) avatarName = v.name; } catch { /* ignore */ } }
         }
       }
@@ -1216,12 +1405,21 @@ export function registerDashboardServices(loader, ctx) {
     const pickGroup = (g) => ({ id: g.id || g.groupId || '', name: g.name || '', iconUrl: imgProxy(g.iconUrl || g.$thumbnailUrl || ''), memberCount: g.memberCount || 0, shortCode: g.shortCode || '', isRepresenting: !!g.isRepresenting });
     const pickWorld = (w) => ({ id: w.id || '', name: w.name || '', imageUrl: imgProxy(w.imageUrl || w.thumbnailImageUrl || ''), authorName: w.authorName || '', description: w.description || '', capacity: w.capacity || 0, favorites: w.favorites || 0, visits: w.visits || 0, releaseStatus: w.releaseStatus || '', createdAt: w.createdAt || '' });
     const pickAvatar = (a) => ({ id: a.id || '', name: a.name || '', thumbnailImageUrl: imgProxy(a.thumbnailImageUrl || ''), imageUrl: imgProxy(a.imageUrl || ''), releaseStatus: a.releaseStatus || '', tags: Array.isArray(a.tags) ? a.tags : [] });
+    // 2026-09-22：把追踪行的本地备注一起带出（弹窗里直接编辑；免得多挂一个常驻 Dialog）
+    let trackedMemo = '';
+    try {
+      const tm = ctx.storage.query('SELECT memo FROM tracked_non_friends WHERE user_id = $u', { $u: uid })[0];
+      trackedMemo = (tm && tm.memo) || '';
+    } catch { /* 忽略 */ }
     return {
       user,
       avatarName,
+      trackedMemo,   // 2026-09-22：追踪行备注（弹窗可编辑）
       representedGroup: representedGroup ? pickGroup(representedGroup) : null,
       mutualFriendCount: mutualFriends.length,
       mutualFriends: mutualFriends.map((f) => ({ id: f.id, displayName: f.displayName || '', avatarUrl: avatarOf(f.userIcon, f.currentAvatarImageUrl || f.currentAvatarThumbnailImageUrl) })),
+      mutualGroupCount: mutualGroups.length,
+      mutualGroups: mutualGroups.map(pickGroup),
       groups: groupArr.map(pickGroup),
       favoriteWorlds,
       worlds: Array.isArray(worlds) ? worlds.map(pickWorld) : [],
@@ -1243,4 +1441,53 @@ export function registerDashboardServices(loader, ctx) {
     };
   });
   loader.serviceOwners.set('dashboard.userProfile', 'core');
+
+  // ── 动态状态（按在线好友数量自动更新自定义状态）──
+  // 读写走 ctx.statusSync（DynamicStatusSync，start-monitor 初始化；默认关闭，config 表 dynamic_status 键）。
+  // service 层只做转发——引擎逻辑（限流/冷却/PUT）见 core/status-sync.js。
+  loader.services.set('dashboard.dynamicStatusGet', () => {
+    const sync = ctx.statusSync;
+    if (!sync) return { enabled: false, template: '', error: 'status-sync 未初始化' };
+    return {
+      ...sync.config,
+      onlineNow: ctx.friendState?.getOnlineCount() ?? null,
+      lastSent: sync._lastSent || '',
+      lastAt: sync._lastAt ? new Date(sync._lastAt).toISOString() : '',
+      lastPutError: sync._lastPutError || '',
+      minIntervalMs: 65_000,
+    };
+  });
+  loader.serviceOwners.set('dashboard.dynamicStatusGet', 'core');
+  loader.services.set('dashboard.dynamicStatusSet', ({ enabled, template, syncNow = true } = {}) => {
+    const sync = ctx.statusSync;
+    if (!sync) return { ok: false, error: 'status-sync 未初始化' };
+    if (enabled !== undefined && typeof enabled !== 'boolean') return { ok: false, error: 'enabled 必须是 boolean' };
+    if (template !== undefined && typeof template !== 'string') return { ok: false, error: 'template 必须是 string' };
+    const config = sync.setConfig({
+      ...(enabled !== undefined ? { enabled } : {}),
+      ...(template !== undefined ? { template } : {}),
+    });
+    const syncResult = syncNow ? await_handle_sync(sync, config.enabled) : { action: 'skipped', reason: 'not-sync-now' };
+    return { ok: true, config, syncResult };
+  });
+  loader.serviceOwners.set('dashboard.dynamicStatusSet', 'core');
+
+  // ── 好友地图统计（#165 数据层的 dashboard 消费面）──
+  // 复用 MCP 工具 handler（同一 ctx 单例）；imageUrl 转 imgProxy 供前端 <img> 直连。
+  loader.services.set('dashboard.friendWorldStats', ({ days = 30, limit = 20 } = {}) => {
+    const r = handleGetFriendWorldStats({ days, limit });
+    return {
+      ...r,
+      stats: r.stats.map((s) => ({
+        ...s,
+        imageUrl: s.imageUrl ? `/api/dashboard/image-proxy?url=${encodeURIComponent(s.imageUrl)}` : '',
+      })),
+    };
+  });
+  loader.serviceOwners.set('dashboard.friendWorldStats', 'core');
+}
+
+// 动态状态 Set 的立即同步（service 内 await 引擎；force=绕过开关与冷却——用户显式保存即意图明确）
+async function await_handle_sync(sync, enabled) {
+  try { return await sync.sync(enabled); } catch (e) { return { action: 'failed', reason: String(e.message || e) }; }
 }

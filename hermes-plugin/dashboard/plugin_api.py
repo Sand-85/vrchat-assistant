@@ -80,11 +80,11 @@ def get_config() -> Dict[str, Any]:
     try:
         return {
             "ok": True,
-            "monitor_dir": pm._resolve_monitor_dir(),
+            "monitor_dir_configured": pm._resolve_monitor_dir() is not None,
             "node_exe": pm._resolve_node_exe(),
-            "env_monitor_dir": os.environ.get("VRC_MONITOR_DIR"),
+            "env_monitor_dir_set": bool(os.environ.get("VRC_MONITOR_DIR")),
             "env_node_exe": os.environ.get("VRC_MONITOR_NODE"),
-            "config_file": str(pm._config_path()),
+            "config_file_exists": pm._config_path().is_file(),
         }
     except Exception:
         logger.exception("get_config failed")
@@ -105,7 +105,7 @@ def get_doctor() -> Dict[str, Any]:
         checks.append({
             "name": "服务目录",
             "ok": monitor_dir is not None,
-            "detail": monitor_dir if monitor_dir else "未找到服务目录：请设置环境变量 VRC_MONITOR_DIR 指向克隆的仓库目录，或参考仓库 AGENTS.md 配置",
+            "detail": "已解析" if monitor_dir else "未找到服务目录：请设置环境变量 VRC_MONITOR_DIR 指向克隆的仓库目录，或参考仓库 AGENTS.md 配置",
         })
 
         checks.append({
@@ -120,7 +120,7 @@ def get_doctor() -> Dict[str, Any]:
             checks.append({
                 "name": "凭据文件",
                 "ok": cred_ok,
-                "detail": f"credentials.json {'存在' if cred_ok else '不存在'}，位于 {monitor_dir}",
+                "detail": f"credentials.json {'存在' if cred_ok else '不存在'}",
             })
         else:
             checks.append({
@@ -135,7 +135,7 @@ def get_doctor() -> Dict[str, Any]:
             "ok": all_ok,
             "checks": checks,
             "resolved": {
-                "monitor_dir": monitor_dir,
+                "monitor_dir_configured": monitor_dir is not None,
                 "node_exe": node_exe,
             },
         }
@@ -199,8 +199,6 @@ def get_credentials() -> Dict[str, Any]:
             "ok": True,
             "configured": configured,
             "email_masked": email_masked,
-            "monitor_dir": monitor_dir,
-            "config_path": str(cred_path) if cred_path else None,
         }
     except Exception:
         logger.exception("get_credentials failed")

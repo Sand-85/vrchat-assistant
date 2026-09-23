@@ -25,13 +25,13 @@ export async function handleSubmitTotp({ code }) {
     serverState.authUser = { id: user.id, displayName: user.displayName };
     serverState.needsOtp = false;
     serverState.needsTotp = false;
-    log(`🔐 TOTP 登录成功: ${user.displayName} (${user.id})`);
+    log(`[认证] TOTP 登录成功: ${user.displayName} (${user.id})`);
     notifier.notifyAuth('recovered', 'TOTP 验证码提交成功，服务已恢复正常');
 
     // 登录成功后立即让 WebSocket 重连上线
     if (wsManager) {
       wsManager.authCooldownUntil = 0;
-      try { wsManager.forceReconnect(); } catch (e) { log(`⚠️ TOTP 后 WS 重连触发失败: ${e.message}`); }
+      try { wsManager.forceReconnect(); } catch (e) { log(`[警告] TOTP 后 WS 重连触发失败: ${e.message}`); }
     }
     return { success: true, displayName: user.displayName, userId: user.id };
   } catch (err) {

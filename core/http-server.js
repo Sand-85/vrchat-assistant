@@ -7,11 +7,50 @@
 import http from 'node:http';
 import { randomUUID } from 'node:crypto';
 import { ctx, log } from './server-context.js';
-import { getLogger } from './logger.js';
+import { getLogger, getLoggerInfo } from './logger.js';
+import { getExtStats } from './ext-log.js';
 import * as registry from './registry.js';
+
+/**
+ * 组装 /health 响应体（review #187 💡E：独立导出以便单测——不依赖请求上下文，仅用传入的运行时对象）。
+ * 关键约束：插件上报只能落 `extras` 段（键空间按插件名隔离），不得参与核心字段命名空间，
+ * 否则插件可覆盖 auth/plugins 等字段（issue #59 的认证语义保护）。
+ */
+export function buildHealthStatus({ ctx: c, storage, rateLimiter, wsManager, friendState, eventPipeline, serverState }) {
+  const uptime = serverState.started ? Math.floor((Date.now() - serverState.started) / 1000) : 0;
+  return {
+    ok: true,
+    // needsTotp 状态下账号并未真正登录（运行期 401 需 TOTP），即使 authUser 仍保留上次缓存，
+    // 也必须报 authenticated:false 并暴露 needsTotp，避免 /health 误报已认证（issue #59）
+    auth: serverState.authUser && !serverState.needsTotp
+      ? { authenticated: true, user: serverState.authUser }
+      : { authenticated: false, needsOtp: serverState.needsOtp, needsTotp: serverState.needsTotp },
+    totpAutoEnabled: !!(c.api?.totpFetcher),
+    db: storage.getStats(),
+    rateLimiter: rateLimiter.getStats(),
+    // 日志配置快照（只读、只增字段）：暴露当前级别/格式/落盘路径/文件与 console 开关/
+    // syslog 前缀，便于排查「日志写到哪、为什么 journalctl 里没有/重复」。
+    logging: getLoggerInfo(),
+    // 外部调用可观测性（只增字段）：VRChat API 客户端统计 + 外部服务失败/兜底统计。
+    // 设计：失败/超时/重试明细在 ops_log（get_ops_log kind=api|ext），此处只给聚合快照，
+    // payload 保持轻量（topFailures 限 5 条、不带堆栈）。
+    api: {
+      client: c.api?.getApiStats ? c.api.getApiStats() : null,
+      ext: getExtStats(),
+    },
+    ws: wsManager?.getState(),
+    friendState: friendState?.getStats(),
+    eventPipeline: eventPipeline?.getStats(),
+    plugins: c.pluginLoader?.getStatus() || [],
+    // 插件侧运行态扩展（issue #186）：按插件名隔离，位于 extras 段内，不参与核心字段命名空间
+    extras: c.healthExtras || {},
+    uptime,
+  };
+}
 
 // 命名日志：MCP 协议层（JSON-RPC 往返），请求日志默认降为 debug 级避免 ping/keepalive 刷屏
 const logMCP = getLogger('mcp');
+const logApp = getLogger('app');
 
 // ── MCP 会话管理 ──
 const sessions = new Map();
@@ -33,6 +72,10 @@ function getOrCreateSession(sessionId) {
 }
 
 // ── SSE 响应辅助 ──
+// 安全：凡可能携带动态文本（异常信息 / 请求派生片段 / 工具输出）的响应一律显式禁用内容嗅探——
+// 响应缺 Content-Type 或仅靠嗅探时，浏览器可能把文本按 HTML 渲染（CodeQL #21 js/xss-through-exception 同族）。
+const NOSNIFF = { 'X-Content-Type-Options': 'nosniff' };
+
 export function sendSSE(res, events, sessionId) {
   if (res.headersSent) return;
   let body = '';
@@ -43,6 +86,7 @@ export function sendSSE(res, events, sessionId) {
     'Content-Type': 'text/event-stream',
     'Cache-Control': 'no-cache',
     'Content-Length': Buffer.byteLength(body),
+    ...NOSNIFF,
   };
   if (sessionId) headers['Mcp-Session-Id'] = sessionId;
   res.writeHead(200, headers);
@@ -56,12 +100,45 @@ export function sendError(res, id, message) {
   }]);
 }
 
+// ── 鉴权 fail-closed ──
+// 读取当前生效的鉴权 token：优先 core.authConfig 服务（start-monitor.js 提供，
+// 读 VRC_MONITOR_AUTH_TOKEN / VRC_MONITOR_API_KEY），服务缺失时回退环境变量。
+function getConfiguredAuthToken() {
+  try {
+    if (ctx.pluginLoader?.hasService?.('core.authConfig')) {
+      const cfg = ctx.pluginLoader.consume('core.authConfig');
+      if (cfg?.token) return cfg.token;
+    }
+  } catch { /* 服务异常按未配置处理 */ }
+  return process.env.VRC_MONITOR_AUTH_TOKEN || process.env.VRC_MONITOR_API_KEY || null;
+}
+
+function authFailClosedBody() {
+  return JSON.stringify({
+    error: 'Unauthorized',
+    message: '鉴权已启用但 http.authenticate 服务不可用（auth-guard 插件缺失或加载失败），fail-closed 拒绝访问',
+  });
+}
+
 // ── 请求路由 ──
 async function handleRequest(req, res) {
   const { storage, rateLimiter, wsManager, friendState, eventPipeline, serverState, paths } = ctx;
   const pathname = (req.url || '').split('?')[0];
 
   // ── 全局 HTTP 鉴权中间件（由 auth-guard 插件或环境配置提供）──
+  // fail-closed：token 已配置但 http.authenticate 服务缺失（auth-guard 缺失/加载失败/热重载中被卸载）
+  // → 一律 401 拒绝，绝不放行。fail-open 仅限「未配置 token」的开发场景。
+  if (getConfiguredAuthToken() && !ctx.pluginLoader?.hasService?.('http.authenticate')) {
+    const errBody = authFailClosedBody();
+    res.writeHead(401, {
+      'Content-Type': 'application/json',
+      'Content-Length': Buffer.byteLength(errBody),
+      'WWW-Authenticate': 'Bearer error="invalid_token"',
+      ...NOSNIFF,
+    });
+    res.end(errBody);
+    return;
+  }
   if (ctx.pluginLoader?.hasService('http.authenticate')) {
     const authResult = ctx.pluginLoader.consume('http.authenticate', req);
     if (!authResult || !authResult.ok) {
@@ -70,6 +147,7 @@ async function handleRequest(req, res) {
         'Content-Type': 'application/json',
         'Content-Length': Buffer.byteLength(errBody),
         'WWW-Authenticate': 'Bearer error="invalid_token"',
+        ...NOSNIFF,
       });
       res.end(errBody);
       return;
@@ -83,10 +161,10 @@ async function handleRequest(req, res) {
     try {
       await route.handler(req, res);
     } catch (err) {
-      log(`❌ 插件 HTTP 路由失败 [${route.pluginName} ${pathname}]: ${err.message}`);
+      logApp.error(`插件 HTTP 路由失败 [${route.pluginName} ${pathname}]: ${err.message}`, { stack: err.stack, pathname, pluginName: route.pluginName });
       if (!res.headersSent) {
         const body = JSON.stringify({ error: 'Internal Server Error', message: err.message });
-        res.writeHead(500, { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) });
+        res.writeHead(500, { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body), ...NOSNIFF });
         res.end(body);
       }
     }
@@ -95,33 +173,25 @@ async function handleRequest(req, res) {
 
   // Health check
   if (req.method === 'GET' && pathname === '/health') {
-    const uptime = serverState.started ? Math.floor((Date.now() - serverState.started) / 1000) : 0;
-    const status = {
-      ok: true,
-      // needsTotp 状态下账号并未真正登录（运行期 401 需 TOTP），即使 authUser 仍保留上次缓存，
-      // 也必须报 authenticated:false 并暴露 needsTotp，避免 /health 误报已认证（issue #59）
-      auth: serverState.authUser && !serverState.needsTotp
-        ? { authenticated: true, user: serverState.authUser }
-        : { authenticated: false, needsOtp: serverState.needsOtp, needsTotp: serverState.needsTotp },
-      totpAutoEnabled: !!(ctx.api?.totpFetcher),
-      db: storage.getStats(),
-      rateLimiter: rateLimiter.getStats(),
-      ws: wsManager?.getState(),
-      friendState: friendState?.getStats(),
-      eventPipeline: eventPipeline?.getStats(),
-      plugins: ctx.pluginLoader?.getStatus() || [],
-      uptime,
-    };
+    const status = buildHealthStatus({ ctx, storage, rateLimiter, wsManager, friendState, eventPipeline, serverState });
     const body = JSON.stringify(status, null, 2);
-    res.writeHead(200, { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) });
+    res.writeHead(200, { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body), ...NOSNIFF });
     res.end(body);
     return;
   }
 
-  // MCP endpoint probe
+  // MCP GET 流：本服务不推送 server→client 消息，按 MCP Streamable HTTP 规范必须
+  // 「返回 text/event-stream」或「返回 405」——**曾经返回 200+空 SSE 并立即 end**，
+  // 导致合规客户端（如 MCP Python SDK / Hermes）判定流断开并**每 1000ms 无限重连**，
+  // 刷屏日志「GET stream disconnected, reconnecting in 1000ms...」（用户实测反馈）。
+  // SDK 行为：405 会计入重连尝试（上限 2 次后停止）；200+立即结束则 attempt 归零 → 死循环。
   if (req.method === 'GET' && pathname === '/mcp') {
-    res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Content-Length': 0 });
-    res.end();
+    res.writeHead(405, { 'Allow': 'POST, DELETE', 'Content-Type': 'application/json', ...NOSNIFF });
+    res.end(JSON.stringify({
+      jsonrpc: '2.0',
+      error: { code: -32000, message: 'This MCP server does not offer a server-initiated SSE stream; use POST for requests (DELETE to end the session).' },
+      id: null,
+    }));
     return;
   }
 
@@ -133,7 +203,7 @@ async function handleRequest(req, res) {
   }
 
   if (req.method !== 'POST' || pathname !== '/mcp') {
-    res.writeHead(404);
+    res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8', ...NOSNIFF });
     res.end('Not Found');
     return;
   }
@@ -198,7 +268,7 @@ async function handleRpc(rpc, session, res) {
           result: { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] },
         }], session.id);
       } catch (err) {
-        log(`❌ ${name} failed: ${err.message}`);
+        logApp.error(`工具调用失败 [${name}]: ${err.message}`, { stack: err.stack, name });
         sendError(res, id, err.message);
       }
       break;
@@ -218,13 +288,34 @@ async function handleRpc(rpc, session, res) {
 // ── 服务器创建 ──
 export function createServer() {
   const { PORT } = ctx.paths;
+
+  // 鉴权 fail-closed 启动期阻断：token 已配置但 http.authenticate 服务不存在
+  // （auth-guard 插件缺失或加载失败）→ 拒绝创建服务器。监听 0.0.0.0 + 有 token 却无鉴权
+  // = 危险配置，绝不能 fail-open；未配置 token 的开发场景不受影响。
+  if (getConfiguredAuthToken() && !ctx.pluginLoader?.hasService?.('http.authenticate')) {
+    throw new Error(
+      '鉴权 fail-closed：已配置 VRC_MONITOR_AUTH_TOKEN（或 VRC_MONITOR_API_KEY），' +
+      '但 http.authenticate 服务不存在（auth-guard 插件缺失或加载失败）。' +
+      '为安全起见拒绝启动：请检查 plugins/official/auth-guard 插件状态，或移除鉴权 token 配置。'
+    );
+  }
+
   const server = http.createServer(async (req, res) => {
     try {
       await handleRequest(req, res);
     } catch (err) {
       log(` Unhandled: ${err.message}`);
       if (!res.headersSent) {
-        try { res.writeHead(502); res.end(err.message); } catch {}
+        // 安全（CodeQL #21 js/xss-through-exception）：异常文本可能含请求派生的片段，
+        // 而原 writeHead(502) 未声明 Content-Type → 浏览器会按内容嗅探成 HTML 渲染。
+        // 故不再回显异常文本：固定文案 + 显式 text/plain + nosniff；细节仍进日志（留痕不静默）。
+        try {
+          res.writeHead(502, {
+            'Content-Type': 'text/plain; charset=utf-8',
+            ...NOSNIFF,
+          });
+          res.end('Bad Gateway：内部错误（详见服务日志）');
+        } catch {}
       }
     }
   });
@@ -238,11 +329,11 @@ export function createServer() {
   // 端口冲突 → 立即退出（防双实例并存互抢 OTP 验证码，issue #49）
   server.on('error', (err) => {
     if (err.code === 'EADDRINUSE') {
-      log(`❌ 端口 ${PORT} 已被占用，请检查是否有旧进程残留`);
+      log(`[失败] 端口 ${PORT} 已被占用，请检查是否有旧进程残留`);
       log('   检测到监控服务可能已在运行，本进程立即退出，避免双实例并存互抢 OTP 验证码');
       process.exit(1);
     } else {
-      log(`❌ 服务器错误: ${err.message}`);
+      log(`[失败] 服务器错误: ${err.message}`);
     }
   });
 

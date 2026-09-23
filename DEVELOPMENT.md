@@ -20,7 +20,7 @@
 
 本仓库的**贡献模型**在 PR-3「解冻」后正式切换为**插件优先**：
 
-- **新功能一律做成插件**：功能贡献者先读 [docs/PLUGIN-DEV.md](./docs/PLUGIN-DEV.md)（插件开发指南）与 [docs/PLUGIN-API.md](./docs/PLUGIN-API.md)（契约 v1.1），在 `plugins/official/<name>/`（随主仓发布）或 `plugins/local/<name>/`（用户私有）里新建一个插件文件夹，经 `register(api)` + `api.registerTool` 暴露 MCP 工具。可复制 [docs/plugin-template/](./docs/plugin-template/) 模板起步。**功能代码不得进 `core/`、不得改核心运行时、不得触碰 `ctx`。**
+- **新功能一律做成插件**：功能贡献者先读 [docs/PLUGIN-DEV.md](./docs/PLUGIN-DEV.md)（插件开发指南）与 [docs/PLUGIN-API.md](./docs/PLUGIN-API.md)（契约 v1.3），在 `plugins/official/<name>/`（随主仓发布）或 `plugins/local/<name>/`（用户私有）里新建一个插件文件夹，经 `register(api)` + `api.registerTool` 暴露 MCP 工具。可复制 [docs/plugin-template/](./docs/plugin-template/) 模板起步。**功能代码不得进 `core/`、不得改核心运行时、不得触碰 `ctx`。** 官方插件可带自身 `package.json` 声明第三方依赖（契约 v1.3，见 docs/PLUGIN-API.md §6.1），原生依赖仍受 §3.3 约束。
 - **核心（`core/`）只收两类改动**：① bug/缺陷修复；②底盘演进（插件运行所需的基础设施，如 `plugin-loader.js` / `plugin-api.js` / `registry.js` / 核心服务注册表 `registerCoreServices()` 的能力扩展）。核心不收「某个具体业务功能的实现」。
 - **新增工具需登记注册名**：插件经 `api.registerTool` 注册的工具，只有其名字在 `core/tool-order.json` 中才会出现在 `tools/list`（`registry.listTools()` 只按该清单遍历）。新增功能工具时，把工具名补进 `core/tool-order.json` 属于「底座演进」类改动，一并随插件 PR 提交（并同步登记进 `skills/vrc-monitor-agent/SKILL.md`「MCP 工具」权威清单）。
 - **三件套（持续演进）**：核心工具（`core/tools/*`，自声明 `tools` 数组、经 `core/registry.js` 注册）＋ 插件（`plugins/official/*`，默认导出 `register(api)`、经 `api.registerTool` 注册）＋ 核心注册表（`core/registry.js`）统一并入 `listTools()` 输出。核心工具走 `ctx`，插件一律走 `api.*`，两者最终对 Agent 呈现为同一套 MCP 工具。
@@ -44,8 +44,25 @@ PR 由 AI Agent 编写提交（人类只提出需求、不直接编码）。以�
 12. **平台专属代码（如 Windows 命名管道）必须满足**：平台门控（非目标平台直接禁用）、探测失败静默回退到跨平台路径、封装 `core/` 模块与跨平台路径共用同一入口、文档中标注适用平台与回退行为。禁止以「平台专属」为由绕过第 2 条（无个人环境硬编码）与第 5 条（文档同步）。
 13. **以 AI Agent 口吻提交**：commit 信息、PR 描述、issue 正文一律用 Agent 自身口吻书写（见 §1「身份表达」），不冒用背后使用者的人称（署名可以用使用者账号，但口吻必须是 Agent）；需求来源段落（第 11 条三段式说明中的"需求来源"）写"使用者提出…"而非"我需要…"，让作者与审查方清楚区分 Agent 的陈述与使用者的原始需求。
 14. **响应审核后必须请求再次审核**：收到审核方 REQUEST_CHANGES（或带修改意见的 COMMENT / 打回评论）并完成修复、推送新 commit 后，**必须在同一 PR 的评论中发一条「请求再次审核」**（标记格式见 AGENT-REVIEW.md §2.7），作为触发审核方复测的动作。**只推 commit 不发请求评论 = 视为未响应审核**，审核方不会对该轮修复执行复测；每响应一轮 REQUEST_CHANGES 都要重复此动作（收到 APPROVE 后不再需要）。
+15. **同一作者连续提交多个 PR → 堆叠提交，并提交前 rebase 到最新 main**：当多个 PR 改动文件重叠或相互依赖时，后一个 PR 的分支 build 在前一个分支上（而非都基于 main），使维护者按依赖顺序批量合并时零冲突。
+   - **需堆叠**：改动文件有交集，或一个依赖另一个的 API/类型/函数（例：动态状态引擎与 safe-mode 均改 `status-sync.js` / `SettingsView.vue` / `AGENTS.md`）。
+   - **不必堆叠**：改动文件完全独立（如一个只改某视图、一个只改 `core/`），可并行提交。
+   - **提交前 rebase 到最新 main**（`git rebase origin/main`），避免基于过期 main 与已合入改动撞车。
+   - **合并顺序**：维护者按依赖顺序合并；栈中某 PR 被打回/延迟时，作者需 rebase 下游 PR 后再提。
+   - **一致性由作者维护**：GitHub 不会自动 rebase 堆叠 PR，前序 PR 合并后作者负责下游 PR 的必要 rebase。
+
 
 > 目前仓库没有 CI，上述脚本是手动验证工具。合并决策由作者（或其 AI Agent）实际运行验证后作出。
+
+## 2.x 前端构建产物策略（issue #186，2026-09-13 起）
+
+**`plugins/official/web-dashboard/ui/dist/` 不入库**（`.gitignore` 强制），由构建步骤生成：
+
+- **谁构建**：`npm run install-plugins`（安装期，`scripts/install-plugin-deps.mjs` 识别插件内 `ui/package.json`）或 `npm run build:dashboard`（单独构建）；Docker 镜像由 `Dockerfile` 的 ui-builder 阶段构建后 COPY 进 runtime。
+- **为什么**：单文件产物 1.5 MB 且逐字符 diff 不可审——并发 UI PR 必然整文件冲突、产物漂移 CI 曾无法发现、仓库体积与审查成本持续增长（issue #186 实测数据）。
+- **运维注记**：`npm run install-plugins` 会**无条件**执行 `npm ci` + 构建（每次调用约 5s+ 依赖校验）；离线/内网用户拉不到 npm 依赖时前端产物缺失，服务回退旧版 UI（离线/内网：可在有网机器 `npm run build:dashboard` 后复制 `ui/dist/` 到目标机）。
+- **纪律**：**禁止提交 `ui/dist/`**（`.gitignore` 已强制；CI `ui-build` job 会断言其未被跟踪）。改了前端源码必须重建产物（本地开发）或依赖安装期/镜像构建（部署）。
+- **运行期行为**：启动三态判定并告警——`built`（正常）/`missing`（**回退旧版 UI** + 告警 + `/health` 上报）/`stale`（源码 mtime 晚于产物：**仍投递现有产物**并发过期告警，不回退）。**产物在插件加载时读入内存**：重建后需重启服务才生效（三态与 `/health` 亦反映启动时刻）。
 
 ## 3. 跨平台约束（重点，必读）
 
@@ -92,7 +109,7 @@ PR 由 AI Agent 编写提交（人类只提出需求、不直接编码）。以�
   - `VRC_MONITOR_X_MIN_TWEETS`：Nitter RSS 返回推文数低于该值时，尝试用 X SearchTimeline 补充并合并去重（默认 0 = 仅当 Nitter 完全失败才降级；设 >0 让高频博主「Nitter 只回 ~20 条覆盖不全」时也触发补充，缓解漏抓）。
   - `VRC_MONITOR_X_PLAYWRIGHT`：Playwright 浏览器抓取开关。默认开启（`1`/`true`/空），设为 `0` 时禁用浏览器通道，直接走 Nitter RSS → SearchTimeline 链。
   - `VRC_MONITOR_X_PLAYWRIGHT_INSTANCES`：浏览器抓取入口实例列表，逗号分隔（默认 `https://nitter.tiekoetter.com`）。可配置多个 Nitter 实例作为回退。
-  - `VRC_MONITOR_X_PLAYWRIGHT_CHANNEL`：Playwright 浏览器通道（默认 `msedge`）。可选 `msedge`、`chrome`、`chromium`，需已安装对应浏览器且 Playwright 已 `npx playwright install`。
+  - `VRC_MONITOR_X_PLAYWRIGHT_CHANNEL`：Playwright 浏览器通道（默认 `auto`——依次尝试 `msedge` → `chrome` → `chromium`，全部不可用则浏览器通道失败并降级）。可选值 `auto`、`msedge`、`chrome`、`chromium`；需已安装对应浏览器且 Playwright 已 `npx playwright install`。
   - `VRC_MONITOR_X_PLAYWRIGHT_TIMEOUT_MS`：浏览器 goto / waitForSelector 超时（默认 45000 ms）。
   - `VRC_MONITOR_X_RESOLVE_TCO`：t.co 短链解包开关。默认开启（`1`/`true`/空），设 `0` 时关闭。推文里的世界链接常被 X 压缩成 `https://t.co/XXXX` 短链（探跡家もっけい、fox_yata9 等博主的世界推荐全在短链里），t.co 现在返回 **200 HTML + `<meta refresh>`**（非 HTTP 302），抓 body 解析 `URL=` 才能拿到真实 `wrld_` 链接。解包在 `fetchCreatorTweets` 统一入口对三个通道（浏览器/Nitter/SearchTimeline）批量执行（并发 3、单链接超时 8s、整体 30s），失败静默、不影响主流程。
   - **浏览器抓取现在作为 `x_scan_creators` / `x_world_digest` 的默认主通道**（Nitter RSS / SearchTimeline 2026 已失效，保留作降级）。
@@ -162,10 +179,19 @@ PR 由 AI Agent 编写提交（人类只提出需求、不直接编码）。以�
 
 ## 6. 测试与 CI
 
-- **现状（含 PR-3 起）**：已接入 GitHub Actions（`.github/workflows/ci.yml`），对 Node 22 × Ubuntu/Windows 跑**无凭据冒烟**：`node test/test-registry.mjs`（注册表完整性，工具数、顺序+定义+handler）、`node scripts/dump-tools.mjs`（权威工具清单，行数与 core/tool-order.json 动态对齐）、`node test/test-migrate-data.mjs`（issue #103 回归：无 data/ 目录启动不崩 + 迁移引导行为/warn 提示）、`python scripts/check-doc-drift.py --json`（文档漂移，`has_drift` 必须为 false）。**CI 里一份真实 VRChat 凭据都没有**，自动化只覆盖「无凭据也能验证」的部分（模块加载、插件加载、DB 初始化、注册表完整、文档一致），涉及真实登录的验证仍需作者人工完成（可用 secrets 里的测试账号，但绝不能泄露到日志）。手动验证脚本：`test/test-apis.mjs`（REST API）、`test/test-websocket.mjs` / `test/test-ws-direct.mjs`（WebSocket）、`scripts/analyze-db.mjs`（数据库分析）。合并以作者实际运行为准，并参考 CI 冒烟结果。
+- **现状（含 PR-3 起）**：已接入 GitHub Actions（`.github/workflows/ci.yml`），对 Node 22 × Ubuntu/Windows 跑**无凭据冒烟**：`npm test`（`node --test "test/**/*.test.mjs"` 全量单测，2026-09-14 起纳入门禁，issue #190）、`node test/test-registry.mjs`（注册表完整性，工具数、顺序+定义+handler）、`node test/test-storage-snapshot.mjs`（storage 行为等价基线）、`node scripts/dump-tools.mjs`（权威工具清单，行数与 core/tool-order.json 动态对齐）、`node test/test-migrate-data.mjs`（issue #103 回归：无 data/ 目录启动不崩 + 迁移引导行为/warn 提示）、`node test/test-auth-guard.mjs`（#159 鉴权 fail-closed 安全网）、`node test/test-safe-mode.mjs`（安全模式门控）、`node test/test-totp.mjs`（TOTP 纯算法）、`python scripts/check-doc-drift.py --json`（文档漂移，`has_drift` 必须为 false）。**具体例数不在此处写死**（每次加测试都会静默过时，且没有门禁能挡这类漂移——以 CI 输出为准）。**CI 里一份真实 VRChat 凭据都没有**，自动化只覆盖「无凭据也能验证」的部分（模块加载、插件加载、DB 初始化、注册表完整、文档一致），涉及真实登录的验证仍需作者人工完成（可用 secrets 里的测试账号，但绝不能泄露到日志）。手动验证脚本：`test/test-apis.mjs`（REST API）、`test/test-websocket.mjs` / `test/test-ws-direct.mjs`（WebSocket）、`scripts/analyze-db.mjs`（数据库分析）。合并以作者实际运行为准，并参考 CI 冒烟结果。
 - **Agent 义务**：涉及 API / WebSocket / 数据库的功能改动，Agent 必须在 PR 描述写明验证方式；能跑现有脚本就跑一遍（尤其 `test/test-registry.mjs` / `scripts/check-doc-drift.py`），不能跑要说明原因。Agent 提交前必须实际运行验证，不能只做静态分析就声称完成。
 - **CI 里的凭据红线**：workflow 文件及其他自动化路径**严禁**出现任何真实凭据、Cookie、token、密码、IMAP 授权码（`credentials.json` 已被 gitignore 排除）。自动化测试账号如需纳入 CI，一律走 GitHub repo secrets 且绝不回显到日志。
-- 新增测试脚本命名沿用 `test-*.mjs` 风格，方便 CI 统一发现。
+- **测试命名与收录范围（2026-09-14 修正，issue #190）**：`package.json` 的 `npm test` 走 `node --test "test/**/*.test.mjs"`——**只有带 `.test` 段的文件会被 glob 收录**，新增单测请用 `<名>.test.mjs` 命名（`npm test` 即覆盖）；`test-*.mjs`（无 `.test` 段）属**独立套件**，`npm test` 一律不收录，只能 `node test/<名>.mjs` 手动执行；**要纳入门禁的独立套件必须在 `ci.yml` 里显式加一步**（当前 CI 显式执行：`test-registry` / `test-storage-snapshot` / `test-migrate-data` / `test-auth-guard` / `test-safe-mode` / `test-totp`）。判据：**「`npm test` 全绿」≠「全仓测试全绿」**——改动涉及鉴权（`test-auth-guard.mjs`，含 #159 fail-closed）、安全模式（`test-safe-mode.mjs`）、TOTP（`test-totp.mjs`）等独立套件覆盖的面时，必须单独跑对应套件后才可声称验证完成（#188 的审查即实测过此坑：改动打红 `test-auth-guard.mjs`，而作者侧 `npm test` 全绿）。
+- **外部调用留痕规范（2026-09 新增，PR：#189 之后的「外部调用可观测性」）**：所有非 VRChat 官方的外部调用（PlanetVRC / X 抓取 / BOOTH / Google Calendar / IMAP-OTP 等）与 VRChat REST 调用都必须留痕，且**逐分支恰好一行**（禁静默降级）：
+  - 失败 / 超时 / 非 2xx / 队列满 / 任务超时 → `WARN`（前缀 `[api]` 或 `[ext]`），同时写 `ops_log`（kind `api` / `ext`），文案含服务、操作、原因、耗时、必要时第几次；
+  - 降级 / 兜底 / 缓存命中 / 跳过（前置条件不满足）→ `INFO`（前缀 `[ext]`），同时写 `ops_log`；
+  - 成功 → `debug`（>2000ms 的慢调用自动升 `INFO`：成功但慢才是信号）；
+  - 实现走**单一来源** `core/ext-log.js`（`logExtFailure` / `logExtFallback` / `logExtSuccess` / `getExtStats`）；插件禁止 `import core/`，改用 `api.extLog.failure/fallback/success`（见 PLUGIN-API §4.7）；
+  - 聚合快照经 `GET /health` 的 `api` 字段暴露（`client` 调用统计 + `ext` 外部服务失败统计），明细用 `get_ops_log`（`kind=api|ext`）查；新增外部调用点若不留痕，评审按阻断项处理。
+  - **限流等待用聚合、不用逐条**（issue #192）：`[limiter]` 的慢等待按「去抖窗口」聚合成一行（默认 30s 无新等待 flush；持续饱和按 5min 上限定期输出），因为串行批刷新下「每位好友一行」与积压无关；`slowWaits`/`maxQueueLen` 保持逐次即时真值，阈值不得为降噪而抬（会打红 `test/rate-limiter-logging.test.mjs` 并静默重定义 `/health` 指标语义）。
+- **插件第三方依赖**：`plugins/official/*` 中带 `package.json` 的插件（目前 emoji-notes 依赖 pinyin-pro）需先执行 `npm run install-plugins`（CI 已在 `npm ci` 后运行此步）。本地/审查环境只跑 `npm ci` 会漏装插件依赖，表现为此类插件整体加载失败、`test/test-registry.mjs` 工具数少于 `core/tool-order.json`（如 105/108）——先补装插件依赖再跑测试，勿误判为代码回归。
+- **测试日志隔离（两条路径，绝不写生产日志目录）**：① `npm test`（package.json 的 test script）通过 `--import ./test/setup-log-isolation.mjs` 把 `VRC_MONITOR_LOGGER_DIR` 钉到每次运行唯一的系统临时目录——显式隔离；② 裸 `node --test`（不经 npm script）只有 `core/logger.js` `resolveDir()` 的 `NODE_TEST_CONTEXT` 单点兜底（node --test 子进程会设 `NODE_TEST_CONTEXT`，日志落到 `os.tmpdir()/vrc-monitor-test-logs`）。两条路径都不会写进生产日志目录 `<VRC_MONITOR_DIR>/logs`（曾实测 96 行 `wrld_kbtest-*` 测试夹具污染生产日志，后修复）。
 
 ## 7. AI Agent 提交前自检清单
 
@@ -175,6 +201,8 @@ PR 由 AI Agent 编写提交（人类只提出需求、不直接编码）。以�
 - [ ] 无本机路径、个人代理、个人账号信息残留
 - [ ] `node start-monitor.js` 可正常启动，`/health` 返回 `authenticated: true`、`ws.status: connected`
 - [ ] 至少跑一遍相关测试脚本（`test/test-apis.mjs` 等），或说明为什么不适用
+- [ ] 前端改动：跑过 `npm test --prefix plugins/official/web-dashboard/ui`（UI vitest）
+- [ ] 前端改动：`catch` 块里**不得**把失败写成业务结论（`= false` / `= []` / `= null` / `return []` 等 ✗）——失败时**保持旧值**，或**置错误态 + 原因 + 重试**（如 `store.loadError` 全局横幅 / `store.feedMoreError` 底部失败态 / 各页面 toast 报错）。`npm test` 里的 `test/frontend-catch-guard.test.mjs` 是**基线冻结闸门**：新增命中必须按规则修，确为合法例外（如「换了新查询清空旧结果 + 同时报错」）则登记进该测试 BASELINE 并写明理由
 - [ ] 新增 / 修改的功能已在 README 或 skills 文档中登记
 - [ ] 数据库变更已考虑存量库迁移
 - [ ] 提交信息符合 Conventional Commits 格式

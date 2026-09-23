@@ -56,6 +56,8 @@ plugins/local/hello/
 | `engines.vrc_monitor` | 否 | 如 `">=3.0.0"`，不满足则拒绝加载并说明 |
 | `depends` | 否 | 依赖的其他插件名数组，如 `["world-kb"]`。loader 按依赖拓扑排序加载；依赖缺失时拒绝加载并报错「请先安装插件 world-kb」。**不设硬版本约束**（过度设计），但提供能力探测：`api.tools.has(name)` / `api.hasService(name)`（§4.6），调用方 catch 错误时能区分「插件没装」vs「装了但版本不兼容/能力缺失」——不兼容时返回带指引的错误而非静默失败。**加载期依赖环**（A depends B 且 B depends A）会被检测，拒绝加载并报环（明示成环插件名），不进入加载。运行时"调用环"不属此类（运行时无锁定、不死锁），但设计上避免互相递归 |
 
+> **dependencies 不在 plugin.json 里声明**：插件第三方依赖统一走插件目录内自带 `package.json`（见 §6.1）。
+
 **清单校验失败的插件被拒绝加载，日志给出具体原因（不影响其他插件）。**
 
 ## 3. register(api) 入口
@@ -72,7 +74,9 @@ export default function register(api) {
 
 插件代码只准通过 `api` 对象与核心交互。**禁止** import 核心内部模块、触碰 `ctx`、直连数据库文件——见 §7 禁止事项。
 
-## 4. API 表面（v1-experimental 共 6 个）
+## 4. API 表面（v1-experimental 共 8 个）
+
+> **计数纪律**：本行数字与本节条目必须同步（新增/移除 API 面时一并改），Changelog 记版本行——避免与代码注释形成双轨。
 
 ### 4.1 api.registerTool(def) — 注册一个 MCP 工具
 
@@ -170,10 +174,43 @@ const digest = await api.consume("query_digest", wrld_xxx);
 - **职责划分**：共享「查询/逻辑」→ `provide/consume`；共享「能力但需要完整 MCP 语义或参数校验」→ `api.tools.call`（§4.5）。**对外暴露给客户端的工具，永远用 `registerTool`，不因 provide/consume 而绕过**。
 - 能力探测：`api.hasService(name)` 查询某服务是否已提供（配合 §2 区分「插件没装」vs「版本不兼容」）。
 
+### 4.7 api.extLog — 外部服务调用留痕（failure / fallback / success）
+
+插件抓取**非 VRChat 官方**的外部站点（PlanetVRC / BOOTH / Google Calendar / 任意第三方 API）时，必须用本面留痕，保证「失败 / 降级兜底 / 跳过错」在日志与运维日志里各留一行（禁静默降级）：
+
+```js
+api.extLog.failure("BOOTH", "抓取搜索结果页", err, { durationMs, attempt });
+api.extLog.fallback("BOOTH", "读取商品 123", "本地缓存命中，跳过远端抓取");
+api.extLog.success("BOOTH", "抓取搜索结果页", { durationMs });
+```
+
+- **分级固定**（与核心 `[api]`/`[ext]` 留痕同口径）：`failure` → `WARN` + `ops_log(kind='ext', level='warn')`；`fallback` → `INFO` + `ops_log('ext','info')`（覆盖缓存命中 / 降级 / 跳过 / 部分失败保留旧数据）；`success` → `debug`（**>2000ms 的慢调用自动升 INFO**——成功但慢才是信号，快成功默认静默，避免逐条刷屏）。
+- **一次触发恰好一行**：每个抓取点都要在「成功 / 失败 / 跳过 / 兜底」各分支调用对应函数，不允许静默返回；实现为**单一来源** `core/ext-log.js`（插件经本面调用，不得 `import core/`，见 §7）。
+- 文案由核心拼装（`服务 操作 失败: 原因（耗时 Xms）`），插件只提供 `service` / `op` / `err` / `reason`；错误信息会被压成单行并截断（防换行注入、防日志爆行）。
+- `durationMs` 建议用 `Date.now()` 差值得出；`attempt` 用于表达「第 N 次」重试。
+- **勿把凭据写进 `op`/`reason`**（如 IMAP 授权码、cookie）——本面会整条落盘并进 ops_log。
+- 聚合快照见 `GET /health` 的 `api.ext`（failures / fallbacks / slow / topFailures ≤5）；明细检索 `get_ops_log(kind='ext')`。
+- 旧核心能力探测：老版本核心不提供本面，插件应写 `api.extLog?.failure?.(...)` 降级为 `api.log(...)`（官方 planet/booth 插件即此写法）。
+
+### 4.8 api.health(obj) — 运行态上报（并入 `/health`）
+
+```js
+export default function register(api) {
+  api.health({ dashboardUi: { state: 'built' } });
+  // → GET /health 的 extras.<pluginName>.dashboardUi
+}
+```
+
+- **用途**：把插件自身的运行态（就绪/降级/缺失等）暴露给运维与 Agent 诊断，无需自建端点。
+- **键空间隔离**：上报内容按 **插件名** 收纳在 `/health` 的 `extras` 段（`extras: { <pluginName>: {...} }`），**不参与核心字段命名空间**——插件无法覆盖 `auth`/`plugins`/`ws` 等核心字段（避免误报认证状态等语义破坏）。
+- **清理**：**卸载、热重载，以及加载/重载失败**（register 抛错、失败回滚）时，loader 均自动清除该插件的 `extras` 键（与路由/服务/工具同路径），无需在 `dispose()` 中手工清理。失败路径同样清理——避免 `/health` 为未加载的插件签名、或为已回滚的插件报错版本状态。
+- **兼容**：旧核心（无此 API 面）下应做能力探测（`typeof api.health === 'function'`）后再调用，否则插件加载会因 `api.health is not a function` 失败。
+
+
 ## 5. 生命周期与热加载
 
 1. **加载**：服务启动时扫描全部插件目录 → 校验清单（含 `depends` 拓扑排序：被依赖者优先加载；依赖缺失 → 拒绝加载该插件并报错指引；依赖环 → 拒绝加载并报环）→ 执行 schema.sql → 调用 `register(api)`（若是 Promise 则 await）。加载失败（语法错误/校验失败/注册冲突）只禁用该插件，日志给出修复指引，服务与其他插件正常。
-2. **热加载**：watch 插件目录。新增插件 → 自动加载；文件变更 → 先调旧版 `dispose()`、注销其全部工具，再加载新版（新版加载失败则回滚旧版并告警）；删除插件 → 调 `dispose()` 并注销其工具。**热加载后既有 WebSocket 连接与进行中的调用不中断**（PR-2 验收用例）。
+2. **热加载**：watch 插件目录。新增插件 → 自动加载；文件变更 → 先调旧版 `dispose()`、注销其全部工具，再加载新版（新版加载失败则回滚旧版并告警；**回滚同时还原旧版的路由与 `/health` 上报快照**，失败新版的工具/路由/上报/服务占用全部释放）；删除插件 → 调 `dispose()` 并注销其工具。**热加载后既有 WebSocket 连接与进行中的调用不中断**（PR-2 验收用例）。
 3. **状态清理**：插件启动的定时器/句柄必须在 `dispose()` 中清理；不重载期间插件内存状态自行负责（崩溃不会传染其他插件，但同插件状态随重载丢失——持久化请用 api.db）。
 4. **状态可见**：`/health` 返回 `plugins` 段：每个插件的 name/version/status/error/**已应用 schema 版本**，便于 Agent 诊断与线上排查「改了没生效」类问题。
 
@@ -184,14 +221,23 @@ const digest = await api.consume("query_digest", wrld_xxx);
 | 注册任意数量 MCP 工具 | import 核心内部模块、触碰全局 ctx |
 | 用 api.db 建自己的表 | 访问其他插件/核心的表 |
 | 用 api.vrchat.fetch 调 VRChat API | 读取凭据（凭据已入库加密，插件不可达） |
-| 用 Node 内置模块 + fetch 访问外网 | 自行 npm install 第三方包（v1 零依赖约定，见下） |
+| 用 Node 内置模块 + fetch 访问外网 | 官方插件可经插件自带 package.json 声明第三方依赖（见 §6.1）；local 插件同样适用 |
 | 读取插件目录内自己的文件 | 写插件目录以外的文件（数据走 api.db） |
 
-**零依赖约定**：v1 插件只准使用 Node ≥22 内置模块（含全局 fetch）。这保证「拷贝文件夹即用」，使用者与 Agent 无需理解依赖管理。确需第三方包属于进阶场景，需在清单声明 `dependencies` 并自带安装说明——主仓官方插件一律遵守零依赖。
+**依赖约定**：插件默认只准使用 Node ≥22 内置模块（含全局 fetch），保证「拷贝文件夹即用」。确需第三方包走插件自带 `package.json` 声明（见 §6.1），不要求在 plugin.json 里声明。
+
+### 6.1 第三方依赖（插件自带 package.json）
+
+1. **声明位置**：插件目录内 `package.json` 的 `dependencies`；`"private": true`；`"type": "module"` 与仓库 ESM 一致；包名用 `vrc-monitor-plugin-<插件名>` 避免撞 npm 公仓。plugin.json 不重复声明 dependencies（唯一权威源是插件目录 package.json，杜绝两处漂移）。
+2. **提交物**：`package.json` 与 `package-lock.json` 都提交进 git（lock 保证各平台可复现、CI 可 `npm ci`）；`node_modules/` 已被根 .gitignore 任意深度忽略，不提交。
+3. **安装**：clone/pull 后在仓库根执行 `npm ci --prefix plugins/official/<name>`（或 `npm run install-plugins` 逐插件探测并 npm ci）。跨平台一致（Win/Linux/mac/NAS/容器）。
+4. **loader 探测**：加载插件前若无依赖可 resolve（`createRequire(插件package.json).resolve(dep)`），则**拒绝加载该插件**（不影响其他插件与主链路），日志与 `/health` plugins 段给出指引：`插件 <name> 缺少依赖 <dep>，请在仓库根执行: npm ci --prefix plugins/official/<name>`。
+5. **loader 绝不自动 npm install**：保持加载路径无副作用、无 child_process、热加载快；缺依赖只拒载 + 指引。
+6. **官方插件依赖准入规则**：每个依赖须纯 JS 优先；确需原生模块须在 PR 说明 prebuilt 对各目标平台（含 ARM NAS、Alpine/musl）的覆盖（DEVELOPMENT.md §3.3 原文继续适用并在此引用）；依赖须 MIT/BSD/Apache-2.0 等兼容许可；PR 描述列出新增依赖名+版本+许可+用途；依赖数量克制（默认 1~3 个），pin 到 semver 范围并提交 lock。
 
 ## 7. 禁止事项（loader 静态扫描 + 运行时防护）
 
-1. 禁止 `import` 任何 `core/` 路径、`start-monitor.js`；禁止动态 `import()` 非插件自身文件；
+1. 禁止 `import` 任何 `core/` 路径、`start-monitor.js`；禁止动态 `import()` 非插件自身文件（**不含裸包名导入**——第三方依赖经 `import x from '<pkg>'`（bare specifier）允许，静态扫描不误报）；
 2. 禁止读取含 `KEY`/`SECRET`/`TOKEN`/`PASSWORD`/`COOKIE`/`AUTH`（忽略大小写）的**环境变量**（含 `VRC_MONITOR_MASTER_KEY`）与仓库根目录任何此类配置文件；允许读取 `VRC_MONITOR_*` 公共配置（排除上述敏感项）；
 3. 禁止读写数据库文件本体（`data/vrc-monitor.sqlite3*`）；一切持久化走 `api.db`；
 4. 禁止访问凭据加密存储、核心 `secure_secrets`（或等价）表、以及任何主密钥解密接口；
@@ -256,5 +302,7 @@ export default function register(api) {
 
 ## Changelog
 
+- **v1.3 (2026-09-13)**：新增 §4.7 `api.extLog`（外部服务调用留痕：`failure`/`fallback`/`success`，失败与降级同步写 `ops_log(kind='ext')`）与 §4.8 `api.health(obj)`（运行态上报 `/health.extras.<pluginName>`，键空间按插件名隔离、卸载/热重载/失败回滚均自动清理）；§4 计数同步为 **8 个 API**（计数以 §4 为准）；核心 `[api]`/`[ext]` 留痕规范见 `AGENTS.md` 环境变量清单末条。
+- **v1.2 (2026-09-05)**：放开插件第三方库限制，落地「插件自带 package.json」依赖机制。
 - **v1.0 (2026-08-23)**：初始契约（registerTool / db / vrchat.fetch / log / tools.call 共 5 个 API）。
 - **v1.1 (2026-08-23)**：experimental 化；新增 §4.6 `api.provide/consume`（共 6 个 API）+ `api.tools.has`/`api.hasService` 能力探测；§4.2 改显式表句柄 + schema 只增不删约定；§4.1 补 destructive 对偶拦截 / outputSchema 扩展位 / 逻辑隔离定性；§2 补 depends 能力探测与加载期环检测＋破坏性前缀校验；§5 补热加载不中断 + schema 版本可见；§7 补敏感文件/env/加密存储禁读 + loader 静态扫描；凭据入库加密（核心基建，随 PR 演进）。

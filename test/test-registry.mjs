@@ -22,8 +22,9 @@ const REPO = path.join(__dirname, '..');
 const Database = require('better-sqlite3');
 const { ctx } = await import(pathToFileURL(path.join(REPO, 'core', 'server-context.js')).href);
 const { Storage } = await import(pathToFileURL(path.join(REPO, 'core', 'storage.js')).href);
-const { PluginLoader } = await import(pathToFileURL(path.join(REPO, 'core', 'plugin-loader.js')).href);
+const { PluginLoader, DESTRUCTIVE_TOOL_NAME_PREFIXES } = await import(pathToFileURL(path.join(REPO, 'core', 'plugin-loader.js')).href);
 const registry = await import(pathToFileURL(path.join(REPO, 'core', 'registry.js')).href);
+const { DESTRUCTIVE_TOOLS, isSafeModeEnabled } = await import(pathToFileURL(path.join(REPO, 'core', 'safe-mode.js')).href);
 const order = JSON.parse(readFileSync(path.join(REPO, 'core', 'tool-order.json'), 'utf-8')).tool_order;
 
 let pass = true;
@@ -47,12 +48,18 @@ loader.services.set('core.authConfig', () => ({ token: null, host: '127.0.0.1', 
 loader.serviceOwners.set('core.authConfig', 'core');
 await loader.loadAll();
 
-const safeMode = process.env.VRC_MONITOR_SAFE_MODE === 'true';
+// 模式判定与生产同口径（isSafeModeEnabled 认 true/1/yes/on，含 .env 值），不自行解析 env
+const safeMode = isSafeModeEnabled();
 const tools = registry.listTools();
 const names = tools.map(t => t.name);
 
-// 1. 数量（tool-order.json 全量 = 95；safe-mode 下过滤 DESTRUCTIVE_TOOLS 10 个）
-const expectedCount = safeMode ? order.length - 10 : order.length;
+// 1. 数量：期望值从事实源推导（core/safe-mode.js 的 DESTRUCTIVE_TOOLS + 定义上的 destructive 标志），
+//    不再硬编码数字——否则清单每次增长都会让本套件在安全模式下误报（issue #208）。
+const registryMap = registry.getRegistryMap ? registry.getRegistryMap() : null;
+const destructiveRegistered = new Set(
+  order.filter(n => DESTRUCTIVE_TOOLS.includes(n) || (registryMap && registryMap.get(n) && registryMap.get(n).destructive))
+);
+const expectedCount = safeMode ? order.length - destructiveRegistered.size : order.length;
 assert(tools.length === expectedCount, `listTools() returned ${tools.length}, expected ${expectedCount}`);
 
 // 2. 唯一
@@ -89,14 +96,55 @@ try {
 
 // 6. safe-mode 破坏性过滤与拦截（清单与 core/safe-mode.js 的 DESTRUCTIVE_TOOLS 同步，含插件工具）
 if (safeMode) {
-  const destructive = ['remove_friend','remove_print','remove_gallery_image','unfavorite_friend','leave_group','decline_friend_request','hide_notification','remove_from_backlog','remove_from_watchlist','x_remove_creator'];
-  assert(JSON.stringify(names) === JSON.stringify(order.filter(n => !destructive.includes(n))), 'safe mode should filter exactly the 10 destructive tools');
-  let blocked = false;
-  try {
-    await registry.dispatch('remove_print', { printId: 'test' });
-  } catch (err) {
-    blocked = err.message.includes('安全模式已启用');
-  }
+  assert(JSON.stringify(names) === JSON.stringify(order.filter(n => !destructiveRegistered.has(n))),
+    "safe mode 应恰好剔除已注册的破坏性工具（" + destructiveRegistered.size + " 项）");
+  assert(names.every(n => !destructiveRegistered.has(n)), 'safe mode 仍对外暴露了破坏性工具');
+
+  // 6.1 独立命名守卫：防「新增破坏性工具却漏进 DESTRUCTIVE_TOOLS」的二次漂移（issue #208），
+  // 也是核心工具唯一的前缀兜底（core/tools/* 不经 loader 的插件静态扫描）。
+  // 前缀表**同源复用** core/plugin-loader.js 的 DESTRUCTIVE_TOOL_NAME_PREFIXES（= docs/PLUGIN-API.md §7 契约），
+  // 不再自列动词表——#209 审查 ⚠️ 指出的正是「两份清单必然漂移」（曾漏 delete_ / unfriend_）。
+  const suspects = order.filter(n =>
+    DESTRUCTIVE_TOOL_NAME_PREFIXES.some(p => n.startsWith(p)) && !destructiveRegistered.has(n)
+  );
+  assert(suspects.length === 0,
+    "以下工具名匹配 §7 破坏性前缀但既不在 DESTRUCTIVE_TOOLS 也无 destructive 标志，请确认口径并同步清单：" + suspects.join(', '));
+
+  // 6.1b 反向自检（#211 审查 ⚠️ 的闭合）：清单每一项必须"能被 §7 前缀识别"，否则必须**显式登记**在例外表里。
+  // 原因：#209 的旧自列正则能覆盖「中段命名」(x_remove_creator) 与 clear_/move_ 两个动词族，
+  // 换成 §7 前缀后这两类不再被识别 → 若清单里新增/保留这类项而不登记，守卫会静默——
+  // 本断言把「清单里有守卫不认识的动词」变成显式失败（两个方向都报警，不靠人记）。
+  const PREFIX_UNRECOGNIZED_EXCEPTIONS = [
+    // 不被 §7 前缀识别、但确属破坏性的清单项（改动本表必须写明理由）
+    'clear_favorite_group',   // clear_ 不在 §7 前缀；批量删除收藏（插件侧另有 destructive:true 声明）
+    'move_world_group',       // move_ 不在 §7 前缀；删旧建新非原子（同上）
+    'move_friend_group',      // 同上
+    'x_remove_creator',       // 中段命名 _remove_；移除追踪博主（**只靠本清单兜底**）
+  ];
+  const unrecognized = DESTRUCTIVE_TOOLS.filter(n =>
+    !DESTRUCTIVE_TOOL_NAME_PREFIXES.some(p => n.startsWith(p)) && !PREFIX_UNRECOGNIZED_EXCEPTIONS.includes(n)
+  );
+  assert(unrecognized.length === 0,
+    "以下清单项既不被 §7 前缀识别、也不在例外表，请确认口径（改 §7 或登记例外）：" + unrecognized.join(', '));
+  const staleExceptions = PREFIX_UNRECOGNIZED_EXCEPTIONS.filter(n => !DESTRUCTIVE_TOOLS.includes(n));
+  assert(staleExceptions.length === 0,
+    "例外表里的项已不在 DESTRUCTIVE_TOOLS，请同步移除：" + staleExceptions.join(', '));
+
+  // 6.2 纵深防御（tools/call）：破坏性必被拦 + 非破坏性必须放行（双向断言，防再次空转）
+  let blockedMsg = '';
+  try { await registry.dispatch('remove_print', { printId: 'test' }); }
+  catch (err) { blockedMsg = err && err.message ? err.message : ''; }
+  assert(blockedMsg.includes('安全模式已启用'), 'safe mode 应拦截破坏性工具 remove_print（tools/call 纵深防御）');
+
+  let nonBlockedResult = null;
+  let nonBlockedErr = '';
+  try { nonBlockedResult = await registry.dispatch('get_server_status', {}); }
+  catch (err) { nonBlockedErr = err && err.message ? err.message : String(err); }
+  // 收紧（#209 审查 💡）：不只是"没被安全模式拦"，而是必须真的 resolve 并返回对象——
+  // 否则"因其它原因抛错"也会被判过。
+  assert(nonBlockedErr === '', 'safe mode 下 get_server_status 不应抛错：' + nonBlockedErr);
+  assert(nonBlockedResult && typeof nonBlockedResult === 'object',
+    'safe mode 下 get_server_status 应正常 resolve 并返回对象');
 }
 
 if (pass) {

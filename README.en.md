@@ -45,19 +45,42 @@ This project is **AI-first**: it is built for AI agents to use and extend. Human
 | [skills/](./skills/) | Ready-to-use Agent Skill collection (MCP tool list, query workflows, development guidelines, etc.; install via AGENTS.md) | Before querying / calling tools / developing |
 | [DEVELOPMENT.md](./DEVELOPMENT.md) | Development guidelines: cross-platform constraints, PR requirements, data privacy, code style | Modifying code / submitting PRs |
 | [ARCHITECTURE.md](./ARCHITECTURE.md) | System architecture: data flow, module responsibilities, dependencies | Understanding the codebase |
-| [docs/PLUGIN-API.md](./docs/PLUGIN-API.md) | Plugin contract (v1.1): the sole contract between a plugin & core — 6 API facets, safety & naming constraints | Read before writing a plugin |
-| [docs/PLUGIN-DEV.md](./docs/PLUGIN-DEV.md) | Plugin development guide: directory structure, register(api), 6 API facets, core service consumption | Writing a plugin / extending features |
+| [docs/PLUGIN-API.md](./docs/PLUGIN-API.md) | Plugin contract (v1.3): the sole contract between a plugin & core — 8 API facets, safety & naming constraints | Read before writing a plugin |
+| [docs/PLUGIN-DEV.md](./docs/PLUGIN-DEV.md) | Plugin development guide: directory structure, register(api), 8 API facets, core service consumption | Writing a plugin / extending features |
 | [docs/history/](./docs/history/INDEX.md) | Project evolution history: milestone timeline, monthly releases/PRs and their significance | New agents should read first |
 | [service-windows/](./service-windows/README.md) | Windows auto-start + crash recovery + daily repair reports (one-click script) | Running persistently on Windows |
 | [service-linux/](./service-linux/README.md) | Linux systemd user service: auto-start + crash recovery + journal logs (one-click script) | Running persistently on Linux |
 
-**MCP Tools**: the service exposes MCP tools covering friend queries, social interactions, media management, group operations, world recommendations, asset search, and more. These tools are layered as **core-domain tools + official plugin-domain tools** (plugin domains: auth-guard / booth / favorites / groups / media / planet / recommend / world-kb / x-creators), output in order by a unified registry. **The complete tool list (all tools) is registered in the [skills/vrc-monitor-agent/SKILL.md](./skills/vrc-monitor-agent/SKILL.md) "MCP Tools" section** — agents call tools from there. The other skills provide workflow guidance per capability (without re-listing tools): `vrchat-social-queries` (social: online/companions/patterns/nicknames), `vrchat-world-queries` (worlds: backlog/recommend/lore), `vrchat-group-queries` (groups: queries/announcements), `booth-query-display` (BOOTH search/display), `vrchat-assistant-development` (development guidelines), `review-workflow` (PR/issue review workflow).
+**MCP Tools**: the service exposes MCP tools covering friend queries, social interactions, media management, group operations, world recommendations, asset search, and more. These tools are layered as **core-domain tools + official plugin-domain tools** (plugin domains: auth-guard / booth / favorites / groups / media / planet / recommend / redeem / world-kb / x-creators; redeem adds code redemption and bundle claiming — `redeem_code` / `get_redeemable_bundles` / `claim_bundle` / `get_inventory_items` / `get_redeem_history`), output in order by a unified registry. **The complete tool list (all tools) is registered in the [skills/vrc-monitor-agent/SKILL.md](./skills/vrc-monitor-agent/SKILL.md) "MCP Tools" section** — agents call tools from there. The other skills provide workflow guidance per capability (without re-listing tools): `vrchat-social-queries` (social: online/companions/patterns/nicknames), `vrchat-world-queries` (worlds: backlog/recommend/lore), `vrchat-group-queries` (groups: queries/announcements), `booth-query-display` (BOOTH search/display), `vrchat-assistant-development` (development guidelines), `review-workflow` (PR/issue review workflow).
 
 ## 🧰 Auxiliary Tools (local, optional)
 
 - `scripts/open-world.mjs`: create a room and open it in a **running VRChat client** (named-pipe direct send, silent fallback to API invite) — `node scripts/open-world.mjs <world ID or name>`
 - `scripts/prepare_image.py`: pre-upload image processing (emoji squaring / Prints 16:9 / Gallery 4:3)
 - `scripts/migrate-vrcx0.mjs`: one-click migration of historical data from VRCX — `node scripts/migrate-vrcx0.mjs`
+
+## 📝 Logs
+
+Service logs go through `core/logger.js`, writing to both stdout and `<VRC_MONITOR_LOGGER_DIR>/monitor.log` by default, with support for levels/format/rotation/redaction.
+
+| Variable | Default | Description |
+|------|--------|------|
+| `VRC_MONITOR_LOGGER_DIR` | `<VRC_MONITOR_DIR>/logs` | Log file directory |
+| `VRC_MONITOR_LOGGER_LEVEL` | `info` | Minimum output level (debug/info/warn/error/silent) |
+| `VRC_MONITOR_LOGGER_FORMAT` | `text` | Log format (`text`/`json`; json is JSONL per line, easy for agents to parse) |
+| `VRC_MONITOR_LOGGER_MAX_SIZE` | `10485760` | Single-file rotation threshold in bytes (default 10MB) |
+| `VRC_MONITOR_LOGGER_MAX_FILES` | `5` | Number of rotated `.gz` files to keep |
+| `VRC_MONITOR_LOGGER_SUPPRESS` | - | Comma-separated substrings; matching lines are dropped entirely (e.g. `ping,keepalive`) |
+| `VRC_MONITOR_LOGGER_CONSOLE` | `1` | Whether to also output to stdout (`0` = file only; not recommended) |
+| `VRC_MONITOR_LOGGER_COLOR` | `auto` | Add ANSI color in text format (files are always colorless) |
+
+For troubleshooting, use JSONL: start with `VRC_MONITOR_LOGGER_FORMAT=json node start-monitor.js`, then filter structured logs with `jq`, e.g.:
+
+```bash
+jq -r 'select(.level=="error") | "\(.ts) [\(.name)] \(.msg)"' "$VRC_MONITOR_LOGGER_DIR/monitor.log"
+```
+
+When a file reaches `MAX_SIZE` it auto-rotates and compresses to `.gz`, named like `monitor-YYYYMMDD-HHMMSS-<pid>.log.gz`, keeping up to `MAX_FILES` files.
 
 ## 🛠 Troubleshooting
 
@@ -90,6 +113,14 @@ If you find this project useful, feel free to buy me a coffee:
 ![QR codes](assets/sponsor-qrcodes.png)
 
 **Please fund my tokens** 🙏
+
+## 🙏 Contributors
+
+Thank you to everyone who made this project better:
+
+![Contributors](https://contrib.rocks/image?repo=ggg123124/vrchat-assistant)
+
+> Avatar grid generated automatically from the GitHub contributors API by [contrib.rocks](https://contrib.rocks).
 
 ## 📄 License
 

@@ -1,11 +1,24 @@
 name: CI
 
 # 无真实 VRChat 凭据的冒烟测试（解冻 PR-3）：
+#   - npm test                   （node --test "test/**/*.test.mjs" 全量单测；issue #190 起纳入门禁）
 #   - test/test-registry.mjs  （注册表完整性：工具数、顺序+定义+handler，无凭据可跑）
 #   - scripts/dump-tools.mjs     （权威工具清单，行数须与 core/tool-order.json 一致——动态推导，不写死）
 #   - test/test-storage-snapshot.mjs（storage 行为等价基线：公共方法「输入→返回」快照，--check 对比 golden）
 #   - test/test-migrate-data.mjs（issue #103 回归：无 data/ 目录启动不崩 + 迁移引导行为/warn 提示）
+#   - test/test-auth-guard.mjs   （#159 鉴权 fail-closed 安全网：启动期拒启 + 运行期 401；issue #190 起纳入门禁）
+#   - test/test-safe-mode.mjs    （安全模式门控：破坏性工具过滤/放行；issue #190 起纳入门禁）
+#   - test/test-totp.mjs         （TOTP 纯算法验证，无网络无凭据；issue #190 起纳入门禁）
 #   - scripts/check-doc-drift.py （文档漂移：skill 工具清单/数字残留/版本同步/死引用，has_drift=false）
+#   - 仓库源码纪律：service-windows/*.cmd|*.bat 必须纯 ASCII（issue #216；tr 判据 + git ls-files|grep -iE，跑 Linux 腿一次）
+#
+# ⚠️ 命名与收录（issue #190）：`npm test` 的 glob 只收 `*.test.mjs`（带 .test 段）；
+#    `test-*.mjs` 是独立套件、不会被 npm test 收录——要进门禁必须像下面这样显式加一步。
+#    反之，以下套件**不得**加入 CI（理由具体到依赖，防止后来者「为了让 CI 更全」把它们塞进来
+#    而把门禁做成随机红绿）：
+#      · test-apis.mjs / test-websocket.mjs / test-ws-direct.mjs —— 需真实 VRChat 凭据（credentials.json / auth cookie）
+#      · test-websocket.mjs / test-ws-direct.mjs —— 另有 120s 固定监听 + 127.0.0.1:7892 代理依赖
+#      · test-fetch-x-worlds.mjs / test-fetch-x-worlds-browser.mjs —— 抓取 X（外网），且 browser 版依赖 playwright
 #
 # 刻意不接入任何真实凭据：本仓库所有自动化测试只能覆盖「无凭据也能验证」的部分，
 # 涉及真实 VRChat 登录的验证仍由作者人工完成（见 DEVELOPMENT.md「测试与 CI」）。
@@ -44,8 +57,31 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Install plugin dependencies (per-plugin package.json)
+        run: npm run install-plugins
+
+      - name: Unit tests (npm test — test/**/*.test.mjs glob)
+        run: npm test
+
+      - name: Auth guard fail-closed regression (issue #159, no credentials)
+        run: node test/test-auth-guard.mjs
+
+      - name: Safe mode gating (no credentials)
+        run: node test/test-safe-mode.mjs
+
+      - name: TOTP algorithm (pure, no credentials)
+        run: node test/test-totp.mjs
+
       - name: Registry integrity (tools, no credentials)
         run: node test/test-registry.mjs
+
+      # issue #208：安全模式那一路此前从未进 CI，导致 test-registry 的魔法数漂移长期静默。
+      # 两种判定形式（true / 1）都跑，同时覆盖 isSafeModeEnabled 的口径一致性。
+      - name: Registry integrity (safe mode, issue #208)
+        shell: bash   # windows runner 默认 PowerShell，VAR=value 语法只在 bash 下成立
+        run: |
+          VRC_MONITOR_SAFE_MODE=true node test/test-registry.mjs
+          VRC_MONITOR_SAFE_MODE=1 node test/test-registry.mjs
 
       - name: Dump tools and assert count = tool-order.json
         shell: bash
@@ -72,3 +108,64 @@ jobs:
           elif command -v python >/dev/null 2>&1; then PY=python
           else echo "::error::python not found"; exit 2; fi
           "$PY" scripts/check-doc-drift.py --json
+
+      - name: Windows scripts are ASCII-only (issue #216)
+        if: runner.os == 'Linux'   # 纯字节扫描、与 OS 无关 → 只在 Linux 腿跑一次
+        shell: bash
+        run: |
+          # cmd.exe 按当前控制台代码页解析批处理文件本身（中文 Windows=cp936）；含非 ASCII 的
+          # .cmd/.bat 会整行错位（issue #212）。判据：非 ASCII 字节数 = 0。
+          # 用 git 索引遍历（含嵌套路径；grep -i 兼顾 .CMD 等大小写变体）; tr 为 POSIX、免外部依赖。
+          bad=0
+          while IFS= read -r f; do
+            [ -e "$f" ] || continue
+            if [ -n "$(LC_ALL=C tr -d '\000-\177' < "$f")" ]; then
+              echo "::error::$f contains non-ASCII bytes — .cmd/.bat must stay ASCII-only (issue #212/#216); put localized text in a separate .txt"
+              bad=1
+            fi
+          done < <(git ls-files | LC_ALL=C grep -iE '[.](cmd|bat)$' || true)
+          exit $bad
+
+  # 产物出库后（issue #186 方案 A）前端必须有可复现构建路径：
+  # 断言 ui/dist 不被入库、且能从源码构建出产物（防「装完没有 UI」/构建静默失败）
+
+  ui-build:
+    name: UI buildable (dist out-of-repo)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Assert dist is NOT tracked (out-of-repo)
+        shell: bash
+        run: |
+          if git ls-files --error-unmatch plugins/official/web-dashboard/ui/dist/index.html >/dev/null 2>&1; then
+            echo "::error::ui/dist is tracked — issue #186 方案 A 要求产物出库"
+            exit 1
+          fi
+
+
+      - name: Install UI deps
+        run: npm ci --prefix plugins/official/web-dashboard/ui
+
+      - name: UI unit tests (front-end regressions)
+        run: npm test --prefix plugins/official/web-dashboard/ui
+
+      - name: Build UI
+        run: npm run build --prefix plugins/official/web-dashboard/ui
+
+      - name: Assert artifact exists and is non-trivial
+        shell: bash
+        run: |
+          f=plugins/official/web-dashboard/ui/dist/index.html
+          if [ ! -f "$f" ]; then echo "::error::ui/dist/index.html missing after build"; exit 1; fi
+          size=$(wc -c < "$f")
+          echo "dist size: $size bytes"
+          if [ "$size" -lt 500000 ]; then echo "::error::dist suspiciously small ($size) — 构建可能静默失败"; exit 1; fi

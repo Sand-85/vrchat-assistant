@@ -102,7 +102,7 @@ export function removePluginTools(origin) {
 }
 
 export function listTools() {
-  const result = [];
+  const defs = [];
   // 整体遍历 ORDER（tool-order.json 统一涵盖核心+插件工具），保证输出顺序稳定
   for (const name of ORDER) {
     const coreDef = coreRegistry.get(name);
@@ -112,23 +112,21 @@ export function listTools() {
       log(`[registry] tool "${name}" in manifest but not registered`);
       continue;
     }
-    result.push({
-      name: def.name,
-      description: def.description,
-      inputSchema: def.inputSchema,
-    });
+    defs.push(def);
   }
   // 插件工具若不在 ORDER（动态加载的本地插件）则按注册顺序追加
   const inOrder = new Set(ORDER);
   for (const def of pluginTools) {
     if (inOrder.has(def.name)) continue;
-    result.push({
-      name: def.name,
-      description: def.description,
-      inputSchema: def.inputSchema,
-    });
+    defs.push(def);
   }
-  return safeMode.filterTools(result);
+  // 先按完整定义过滤（安全模式依据 destructive 标志，见 safe-mode.filterTools），
+  // 再投影为对外公开形状（name/description/inputSchema），保持 tools/list 载荷不变。
+  return safeMode.filterTools(defs).map(def => ({
+    name: def.name,
+    description: def.description,
+    inputSchema: def.inputSchema,
+  }));
 }
 
 export async function dispatch(name, args) {
@@ -149,7 +147,7 @@ export async function dispatch(name, args) {
   } catch (err) {
     if (err.needsTotp) {
       ctx.serverState.needsTotp = true;
-      log('🔑 检测到需要 TOTP 验证码，请调用 submit_totp 完成登录');
+      log('[认证] 检测到需要 TOTP 验证码，请调用 submit_totp 完成登录');
       notifier.notifyAuth('needsTotp', '运行期会话失效需 TOTP 验证码，服务暂停——请调用 submit_totp 提交当前验证码');
     }
     throw err;

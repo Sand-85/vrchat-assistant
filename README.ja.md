@@ -45,19 +45,42 @@
 | [skills/](./skills/) | すぐ使える Agent Skill 集（MCP ツール一覧、クエリワークフロー、開発ガイドラインなど。導入方法は AGENTS.md） | ツール呼び出し / 開発前 |
 | [DEVELOPMENT.md](./DEVELOPMENT.md) | 開発ガイドライン：クロスプラットフォーム制約、PR 要件、データプライバシー、コード規約 | コード変更 / PR 提出時 |
 | [ARCHITECTURE.md](./ARCHITECTURE.md) | システムアーキテクチャ：データフロー、モジュール責務、依存関係 | コードベース理解時 |
-| [docs/PLUGIN-API.md](./docs/PLUGIN-API.md) | プラグイン契約（v1.1）：プラグインとコアの唯一の契約 — 6 面 API、安全・命名制約 | プラグイン作成前に必読 |
-| [docs/PLUGIN-DEV.md](./docs/PLUGIN-DEV.md) | プラグイン開発ガイド：ディレクトリ構成、register(api)、6 面 API、コアサービス利用 | プラグイン作成 / 機能拡張時 |
+| [docs/PLUGIN-API.md](./docs/PLUGIN-API.md) | プラグイン契約（v1.3）：プラグインとコアの唯一の契約 — 8 面 API、安全・命名制約 | プラグイン作成前に必読 |
+| [docs/PLUGIN-DEV.md](./docs/PLUGIN-DEV.md) | プラグイン開発ガイド：ディレクトリ構成、register(api)、8 面 API、コアサービス利用 | プラグイン作成 / 機能拡張時 |
 | [docs/history/](./docs/history/INDEX.md) | プロジェクト進化史：マイルストーン、月次リリース/PR とその意義 | 新規エージェントは最初に読む |
 | [service-windows/](./service-windows/README.md) | Windows 自動起動 + クラッシュ自己復旧 + 毎日修復レポート（ワンクリックスクリプト） | Windows で常駐運用する場合 |
 | [service-linux/](./service-linux/README.md) | Linux systemd ユーザーサービス：自動起動 + クラッシュ自己復旧 + journal ログ（ワンクリックスクリプト） | Linux で常駐運用する場合 |
 
-**MCP ツール**：サービスはフレンド照会、ソーシャル操作、メディア管理、グループ操作、ワールドレコメンド、アセット検索などの分野をカバーする MCP ツールを公開しています。これらのツールは**コア領域ツール + 公式プラグイン領域ツール**のレイヤーで構成され（プラグイン領域：auth-guard / booth / favorites / groups / media / planet / recommend / world-kb / x-creators）、統一レジストリによって順に出力されます。**完全なツール一覧（全ツール）は [skills/vrc-monitor-agent/SKILL.md](./skills/vrc-monitor-agent/SKILL.md) の「MCP ツール」セクションに統一登録されています**——エージェントはそこから呼び出します。他の skill は各分野のワークフロー補助です（ツールの重複登録はしません）：`vrchat-social-queries`（ソーシャル：オンライン/同インスタンス/パターン/ニックネーム）、`vrchat-world-queries`（ワールド：待逛/レコメンド/情報探索）、`vrchat-group-queries`（グループ：照会/アナウンス）、`booth-query-display`（BOOTH 検索/表示）、`vrchat-assistant-development`（開発ガイドライン）、`review-workflow`（PR/issue レビューワークフロー）。
+**MCP ツール**：サービスはフレンド照会、ソーシャル操作、メディア管理、グループ操作、ワールドレコメンド、アセット検索などの分野をカバーする MCP ツールを公開しています。これらのツールは**コア領域ツール + 公式プラグイン領域ツール**のレイヤーで構成され（プラグイン領域：auth-guard / booth / favorites / groups / media / planet / recommend / redeem / world-kb / x-creators。redeem は引換コードの投入とバンドルの受取（`redeem_code` / `get_redeemable_bundles` / `claim_bundle` / `get_inventory_items` / `get_redeem_history`）を提供）、統一レジストリによって順に出力されます。**完全なツール一覧（全ツール）は [skills/vrc-monitor-agent/SKILL.md](./skills/vrc-monitor-agent/SKILL.md) の「MCP ツール」セクションに統一登録されています**——エージェントはそこから呼び出します。他の skill は各分野のワークフロー補助です（ツールの重複登録はしません）：`vrchat-social-queries`（ソーシャル：オンライン/同インスタンス/パターン/ニックネーム）、`vrchat-world-queries`（ワールド：待逛/レコメンド/情報探索）、`vrchat-group-queries`（グループ：照会/アナウンス）、`booth-query-display`（BOOTH 検索/表示）、`vrchat-assistant-development`（開発ガイドライン）、`review-workflow`（PR/issue レビューワークフロー）。
 
 ## 🧰 補助ツール（ローカル・任意）
 
 - `scripts/open-world.mjs`：ルームを作成し**実行中の VRChat クライアント**内で開く（名前付きパイプ直接送信、失敗時は API 招待にサイレントフォールバック）— `node scripts/open-world.mjs <ワールドIDまたは名前>`
 - `scripts/prepare_image.py`：アップロード前の画像処理（絵文字の正方形化 / Prints 16:9 / Gallery 4:3）
 - `scripts/migrate-vrcx0.mjs`：VRCX からの履歴データをワンクリック移行 — `node scripts/migrate-vrcx0.mjs`
+
+## 📝 ログ
+
+サービスログは `core/logger.js` に統一され、デフォルトで stdout と `<VRC_MONITOR_LOGGER_DIR>/monitor.log` の両方に書き込みます。レベル・形式・ローテーション・機密情報のマスキングに対応。
+
+| 変数 | デフォルト | 説明 |
+|------|--------|------|
+| `VRC_MONITOR_LOGGER_DIR` | `<VRC_MONITOR_DIR>/logs` | ログファイルディレクトリ |
+| `VRC_MONITOR_LOGGER_LEVEL` | `info` | 最低出力レベル（debug/info/warn/error/silent） |
+| `VRC_MONITOR_LOGGER_FORMAT` | `text` | ログ形式（`text`/`json`。json は1行ごとに JSONL、agent が解析しやすい） |
+| `VRC_MONITOR_LOGGER_MAX_SIZE` | `10485760` | 単一ファイルのローテーション閾値（バイト、デフォルト10MB） |
+| `VRC_MONITOR_LOGGER_MAX_FILES` | `5` | 保持する回転済み .gz ファイル数 |
+| `VRC_MONITOR_LOGGER_SUPPRESS` | - | カンマ区切りの部分文字列。一致する行は丸ごと破棄（例 `ping,keepalive`） |
+| `VRC_MONITOR_LOGGER_CONSOLE` | `1` | stdout にも出力するか（`0` はファイルのみ。非推奨） |
+| `VRC_MONITOR_LOGGER_COLOR` | `auto` | text 形式に ANSI 色を付けるか（ファイルは常に無色） |
+
+トラブルシューティングには JSONL 形式が便利：`VRC_MONITOR_LOGGER_FORMAT=json node start-monitor.js` で起動し、`jq` で構造化ログをフィルタリング、例：
+
+```bash
+jq -r 'select(.level=="error") | "\(.ts) [\(.name)] \(.msg)"' "$VRC_MONITOR_LOGGER_DIR/monitor.log"
+```
+
+単一ファイルが `MAX_SIZE` に達すると自動で `.gz` にローテーション・圧縮され、`monitor-YYYYMMDD-HHMMSS-<pid>.log.gz` のような名前になり、最大 `MAX_FILES` 個保持されます。
 
 ## 🛠 トラブルシューティング
 
@@ -90,6 +113,14 @@ QQ グループ：**851865556** — 利用方法の質問、機能提案、フ�
 ![QRコード](assets/sponsor-qrcodes.png)
 
 **トークンの費用をサポートしてください** 🙏
+
+## 🙏 コントリビューター
+
+このプロジェクトをより良くしてくれた全てのコントリビューターに感謝します：
+
+![コントリビューター](https://contrib.rocks/image?repo=ggg123124/vrchat-assistant)
+
+> アバターグリッドは [contrib.rocks](https://contrib.rocks) が GitHub コントリビューター API から自動生成しています。
 
 ## 📄 ライセンス
 

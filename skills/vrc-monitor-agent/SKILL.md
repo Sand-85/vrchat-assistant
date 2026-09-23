@@ -35,13 +35,19 @@ metadata:
 | `get_my_favorite_worlds` | **我的收藏世界**（2026-08-14 新增）：拉取全部收藏世界（**含 VRC+ 专属收藏夹**），按标签分类（🎮游戏/👻恐怖/🎵音乐体验/🌄风景观光/🧍Avatar模型/🍻社交聚会/😴休闲睡觉/📷拍照/其他），返回世界名/作者/收藏/浏览/简介/分类。数据经 `GET /worlds/favorites` 分页一次拉全（含实时 `occupants`），**秒级返回**，无需逐个查详情。`sortBy` 支持 `favorites`/`visits`/`name`/`added`（**added=按收藏时间倒序，最新添加在前**，基于 `/favorites` 返回顺序，与客户端 "Date Added" 一致）；`group` 参数可按收藏夹过滤（tag 或 displayName，如 `vrcPlusWorlds1`）；配套 `favorites-pdf.py` 一键生成中文 PDF |
 | `get_my_favorite_groups` | **我的收藏分组**：世界收藏分组（`world` + `vrcPlusWorld` 两种类型，**含 VRC+ 专属收藏夹**），返回 tag/显示名/类型/可见性/容量 `capacity`（来自 `/auth/user/favoritelimits`）/已用数/分组 id；`type` 参数可按类型过滤 |
 | `backup_database` | 立即备份数据库（WAL 在线备份，保留最近 2 份到 data/backups/）；服务启动 + 每 24h 自动备份 |
+| `get_dynamic_status` | **动态状态引擎配置查询**（按在线好友数量自动更新自己的自定义状态 statusDescription）：enabled（开关,默认关闭）、template（文本模板,{online} 占位符替换为当前在线好友数）、onlineNow、lastSent/lastAt（最近一次实际提交） |
+| `set_dynamic_status` | **设置动态状态**：enabled 开关（默认关闭）、template 模板（{online} 占位符,最长 64 字符）、syncNow 保存后立即强制同步（默认 true）。引擎内置 65s 冷却 + 文本不变不提交（PUT /users/{userId} 只改 statusDescription,status 种类不变）；事件驱动（friend-online/offline）+ 5 分钟定时核对兜底 |
+| `get_presence_status` | **按在场自动状态配置查询**（presence-status 插件：按自己是否在游戏内切换自定义状态文字，采用"捕获+恢复"模型）：config（enabled / idleTemplate / pollSeconds）、presence（核心自我在场三态 in_game 游戏内 / not_in_game 不在游戏 / unknown 无法判定，含 location/at/ageMs）、savedText（出游戏时捕获的"上次下线状态"，回游戏时恢复用）、lastState/lastText/lastAppliedAt/lastError、serviceAvailable、minApplyIntervalMs |
+| `set_presence_status` | **设置按在场自动状态**（presence-status 插件）：enabled 开关（默认关闭）、idleTemplate 不在游戏时写入的文案（≤64 字符，只改 statusDescription、status 种类原样保留）、savedText 回游戏时恢复用的文字（省略=保留捕获值；空串=清空）、pollSeconds 轮询间隔秒（默认 60，下限 20，上限 3600）、syncNow 保存后立即同步（默认 true）。判定源 = 核心服务 `dashboard.selfPresence`（user-location 事件三态）；**只在进/出游戏的转换点动作**（出游戏先捕获当前文案再写挂机文案；回游戏写回捕获值）；unknown 不翻转现状；两次 PUT 最小间隔 65s、目标文案已在位不提交 |
 | `get_friend_events` | 某好友的事件历史（本地库） |
-| `get_recent_events` | 最新事件流 |
+| `get_recent_events` | 事件流查询：无 typeFilter 时返回最新事件窗口；带 typeFilter 为 **SQL 层按类型检索**（返回该类型最近事件，可查任意历史类型，如 `typeFilter="friend-delete"`） |
+| `get_friend_removals` | **[friend-removals 插件] 谁把我删了**：列出历史上解除好友的人（friend-delete 事件）。userId 省略=全部；days=最近 N 天；返回 userId/displayName（回填最后使用名）/nickname/createdAt |
 | `get_companions` | **同屏交叉查询**（指定时间窗口内同实例的好友；可查自己或任意好友）。**默认不返回 userTimeline**（位置事件多时输出会过大被截断），仅返回 companions 汇总；需逐条位置明细时传 `includeTimeline=true` |
 | `get_recent_cooplay` | **最近一起玩**（最近 N 天与自己同屏过的全部好友，按同屏次数降序）：companions[{userId, displayName, matchCount, daysCount, lastDay}]；days(1-90 默认 7)、limit(默认 30)。与 get_friend_pair_screen（两人版带逐条 matches）互补——面向自己的全好友批量版 |
+| `get_friend_world_stats` | **好友地图统计**（好友群体最近 N 天去过的世界按热度聚合，发现好友圈热门图）：stats[{worldId, worldName, imageUrl, authorName, visitors（去过的不同好友数,主排序）, visits（总进入次数）, lastSeen, friends（好友名样本 ≤5）}]；days(1-365 默认 30)、limit(1-100 默认 20)。纯本地统计无 API 调用 |
 | `get_ops_log` | **运维日志**（认证/WS/运维生命周期事件，保留最近 500 条）：返回 items[{id, kind, level, message, createdAt}]；limit(1-1000 默认 200)、kind(可选 'auth'\|'ws'\|'ops') |
-| `get_friend_pair_meeting` | **好友对单次见面分析**（查任意两个好友之间「每次见面」的时段与时长；按实例切分，同一实例内同屏匹配合并为一次见面（**含实例内中途断开空档，合并为一次**），返回每次 start/end/durationMinutes/世界/实例 + meetingCount + totalDurationSeconds；口径：同实例且时间差 ≤ windowMinutes（默认30），排除 private/offline/traveling；startTime/endTime 与 days 二选一） |
-| `get_friend_pair_screen` | **好友对同屏次数与时长**（查任意两个好友之间的共玩/同房统计；精确口径：B 的每条可识别实例事件匹配 A 同一实例且时间差 ≤ windowMinutes（默认30）→ 计同屏；排除 private/offline/traveling，不同时间去过同一房不计；返回 matchCount（次数）、totalMinutes/totalSeconds（总时长，段首到段尾累加，**含实例内中途断开空档**）、worldDuration（按世界拆分时长）、worlds（共现世界）、matches（默认全量，可加 limit 限制条数）；startTime/endTime 与 days 二选一） |
+| `get_friend_pair_meeting` | **好友对单次见面分析**（查任意两个用户（含自己）之间的「每次见面」时段与时长；self-pair 时 userIdA/B 可填自己的 userId，服务端同样扫描 user-location 与 friend-location 两类事件（与 get_friend_pair_screen 共用匹配引擎）；按实例切分，同一实例内同屏匹配合并为一次见面（**含实例内中途断开空档，合并为一次**），返回每次 start/end/durationMinutes/世界/实例 + meetingCount + totalDurationSeconds；口径：同实例且时间差 ≤ windowMinutes（默认30），排除 private/offline/traveling；startTime/endTime 与 days 二选一） |
+| `get_friend_pair_screen` | **好友对同屏次数与时长**（查任意两个用户（含自己）之间的共玩/同房统计；self-pair 时 userIdA/B 可填自己的 userId（与 get_recent_cooplay 的 meId 一致），服务端会同时扫描 user-location 与 friend-location 两类事件；精确口径：B 的每条可识别实例事件匹配 A 同一实例且时间差 ≤ windowMinutes（默认30）→ 计同屏；排除 private/offline/traveling，不同时间去过同一房不计；返回 matchCount（次数）、totalMinutes/totalSeconds（总时长，段首到段尾累加，**含实例内中途断开空档**）、worldDuration（按世界拆分时长）、worlds（共现世界）、matches（默认全量，可加 limit 限制条数）；startTime/endTime 与 days 二选一） |
 | `get_online_pattern` | **上线规律分析**（上线/下线/活跃时段分布 + 活跃天数/频率 + 峰值建议） |
 | `get_world_name` | 世界信息查询（懒刷新：缓存命中直接返回，forceRefresh 才走 API；含作者ID/作者名/容量/简介/标签/用户备注 note） |
 | `get_worlds_by_author` | **按作者列出全部世界**：authorId 或 authorName（内部经 /users 解析）→ GET /worlds?userId= 分页拉全该作者发布的全部图（worldId/名称/收藏/浏览/容量/标签/发布时间），顺带写 world_cache（含 author_id）。配合 get_world_name 返回的 authorId 使用（如「当前所在图作者的全部图加权重」） |
@@ -53,7 +59,7 @@ metadata:
 | `rate_world` | **用户反馈**：给世界打好评/烂图标记（rating: 1=好图加权 / -1=烂图降权 / 0=清除），写入 world_kb.user_rating，影响 worldScore 推荐排序 |
 | `mark_world_visited` | **显式确认逛过**某世界（事件驱动 visited 会漏记，开图闭环手动确认用） |
 | `set_world_sleep` | **手动标记睡觉图**（worldId 必填，isSleep 默认 true，false=取消），写入 world_kb.sleep_ok=1，recommend_join / recommend_worlds（sleep 主题）的强信号。本地数据，不动云端 |
-| `add_to_backlog` | **加入待逛列表**（本地待办，不动云端收藏）：worldId 必填，reason/priority（0-2，默认 0）可选。幂等：重复加入更新备注/优先级，加入时间保持首次。状态存 world_kb.backlog（合表方案） |
+| `add_to_backlog` | **加入待逛列表**（本地待办，不动云端收藏）：worldId 必填，reason/priority（0-2，默认 0）可选。幂等：重复加入更新备注/优先级，加入时间保持首次。状态存 world_kb.backlog（合表方案）。世界不在 world_kb 时插兜底行并回填 world_name/author/created_at（缓存优先，缺失走 API；`mark_world_visited`/`rate_world`/`set_world_sleep` 同路径） |
 | `get_backlog` | **查看待逛列表**：status（pending 默认=未逛 / visited=逛完历史 / all）、sortBy（added_at 默认 / priority / favorites）、limit（1-50）。**逛完自动从待逛列表移除**（location 事件 / mark_world_visited / 扫描在首次置 visited=1 时同步清 backlog=0），pending 只显示仍待逛的世界 |
 | `remove_from_backlog` | **移出待逛列表**：worldId 必填。只清 backlog 标记（保留行/世界知识），幂等 |
 | `recommend_worlds` | **多源融合世界推荐**：local 新世界池 × PlanetVRC × 官方主题搜索 × 用户反馈，评分（热度+新鲜度+主题+作者画像 30 天窗口熟客）+ 可解释 reasons；theme/excludeTheme/sources/excludeVisited 参数 |
@@ -64,9 +70,13 @@ metadata:
 | `clear_favorite_group` | **清空收藏分组**（2026-08-26 新增）：DELETE /favorite/group/{type}/{name}/{userId}，清空组内全部收藏（分组本身保留，重新收藏可加回）。group 必填；批量删除，destructive，confirm: true 才执行 |
 | `get_nicknames` / `set_nickname` | 好友昵称映射（查询/写入，本地库） |
 | `get_mutual_friends` | 共同好友列表：你与目标用户（userId 或 displayName 精确匹配）的共同好友，自动带本地昵称 |
+| `get_mutual_groups` | **共同群组列表**：你与目标用户（userId 或 displayName 精确匹配）都加入的群组，含成员数——社交破冰/找共同话题用 |
 | `get_watchlist` / `add_to_watchlist` / `remove_from_watchlist` | 关注名单 |
 | `send_boop` | 戳一戳好友（Boop），对方收到戳戳通知（参数：userId 必填、emojiId 可选） |
 | `get_boop_emojis` | 列出内置 boop 表情（65 个）及 emojiId 格式（`default_<name>`） |
+| `set_emoji_note` | [manage] 给 emojiId（内置 default_xxx 或自定义 fileId）设备注/别名，存本地；note 与 aliases 都为空时软删除该条 |
+| `get_emoji_notes` | [query] 列出 emoji 备注（可按 emojiId / kind 过滤，默认只返回有效项） |
+| `resolve_emoji` | [query] 把口语化/可能带 STT 噪声的中文表情描述解析成 emojiId，支持别名/拼音同音/分词重叠/编辑距离；歧义时返回候选不瞎猜 |
 | `upload_emoji` | 上传自定义 boop 表情（需 VRChat Plus；imagePath 必填，animated/animationStyle 可选） |
 | `upload_print` | 上传照片到 VRChat 相册 Prints（需 VRC+；imagePath 必填，note 可选备注） |
 | `upload_gallery_image` | 上传图片到 VRC+ 图库 Gallery（需 VRC+；imagePath 必填） |
@@ -84,9 +94,17 @@ metadata:
 | `send_friend_request` | 发送好友请求（添加好友；userId 直接加 或 displayName 精确匹配不区分大小写，二选一） |
 | `remove_friend` | 删除好友（不可逆！userId 或 displayName 精确匹配，必须传 confirm: true 才执行，否则只预览目标） |
 | `get_server_status` | 服务/认证状态 |
+| `get_inventory_global` | **全局物品栏**：账号级物品列表（名称/描述/装备槽/获取方式），self-only |
+| `get_inventory_drops` | **待领取掉落**：账号当前可领的物品掉落（空=无），self-only |
+| `redeem_code` | **[redeem 插件] 提交兑换码**：`POST /reward/redeem`。码是**一次性消耗品**（成功不可回滚）。返回换到的物品/礼包（含 `itemType`/`contains`/`inventoryId`）；**含礼包时需再 `claim_bundle`** 才会真到手。失败如实返回 `{ok:false,status,error}`（码失效/已用/拼错）；HTTP 200 + 非空 `errors[]` 同样判 `ok:false` |
+| `get_redeemable_bundles` | **[redeem 插件] 待领取礼包**：`GET /inventory?types=bundle`（`limit` ≤100、`offset` 翻页，返回 `total`/`hasMore`）→ `inventoryId`/名称/获得时间/`expiryDate`（null=不过期）/`seen`。空 = 没有待领礼包（VRC+ 掉落、活动礼包都走这里） |
+| `claim_bundle` | **[redeem 插件] 领取（打开）礼包**：`POST /inventory/{inventoryId}/consume` → 到手物品清单（`name`/`itemType`/`description`/`acquisition`）。⚠️ `inventoryId` 必须取自 `get_redeemable_bundles` 的 `inv_*`（`redeem_code` 给的 `invt_*` 是模板 id、不可用，实测 404）。领取后从待领列表消失，**不可重复领取**；`ok` 由响应 `errors` 判定 |
+| `get_inventory_items` | **[redeem 插件] 库存物品主列表**：`GET /inventory`（`type` 过滤如 nameplateEffect；`limit` ≤100、`offset` 翻页，返回 `total`/`hasMore`）。⚠️ 返回顺序**不保证按时间排序**——「核对到账」须按 type 过滤或翻页取全，只看第一页可能误判「未到账」。核心 `get_inventory_global` 只给账号级全局物品（`/inventory/global`） |
+| `get_redeem_history` | **[redeem 插件] 兑换/领取历史**（插件私有表 `plg_redeem_history`，跨重启保留）：`kind`(redeem\|claim)/`code`/`inv_id`/`name`/`ok`/`detail`/时间（UTC），可按 `limit`/`kind` 过滤 |
 | `get_database_stats` | 数据库统计 |
 | `get_user_groups` | 用户加入的群组列表（`userId` 可选，省略 = 当前账号；`withDetails: true` 批量带简介；`GET /users/{userId}/groups`） |
 | `get_group_info` | 群组详情（名称/成员数/shortCode/描述/认证状态/joinState(open/request/invite)；`includeAnnouncement: true` 附带公告，非成员为 null） |
+| `get_group_invites` | **收到的群组邀请**：账号待处理的群组邀请列表（含群名/成员数/描述）。self-only——查他人 403 |
 | `get_group_instances` | **群组当前开的房**（group rooms）：instanceId/location/memberCount + 世界信息；空 = 没开房。适合"XX 群今晚有没有活动房"类问题 |
 | `get_group_announcement` | 群组公告（title/text/作者/时间；无公告或非成员返回 null 不报错） |
 | `get_group_heat` | **群组热度**：群组房活动热度榜（活动次数/活跃好友/世界数/成员数/趋势）+ 前 topK 群（星期×小时）热力图；`grp_`/`gmem_` 兼容 |
@@ -177,6 +195,12 @@ curl -s http://127.0.0.1:8799/mcp -X POST \
 ### boop 通知在 notification-v2 里
 
 boop 通知落库的顶层事件类型是 `notification-v2`（不是 boop），boop 在 content_json.type 里。`get_recent_events(typeFilter="boop")` 查不到，用 `typeFilter="notification-v2"`。
+
+### 好友删除事件 friend-delete（谁把我删了）
+
+- VRChat **对方解除好友**时，你的 WS 会收到 `friend-delete` 事件（本地已实时落库并自动把该好友移出 friends 表）；自己主动删人走 `remove_friend`，不产生此事件。
+- 该事件 **display_name 为空**（解除后 VRChat 不再下发对方信息）——判断"是谁"需靠 userId，可用 `get_friend_events(userId)` 回溯其历史事件中的显示名，或直接调用 `get_friend_removals`（friend-removals 插件已封装名字回填）。
+- 查询历史：`get_recent_events(typeFilter="friend-delete")`（2026-09-06 起 typeFilter 为 **SQL 层类型检索**，可查全史）；或 `get_friend_events(userId, types="friend-delete")`。语义化入口推荐 `get_friend_removals()`（插件）。
 
 ### 存储引擎：better-sqlite3（WAL 模式，2026-08-09 起）
 

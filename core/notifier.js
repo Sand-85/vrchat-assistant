@@ -86,7 +86,7 @@ class AuthNotifier {
 
   _dispatch(kind, message) {
     // 无论通道是否成功都保留日志，维持现有可观测性
-    log(`🔔 [notify] ${kind}: ${message}`);
+    log(`[通知] ${kind}: ${message}`);
     for (const ch of this.channels) {
       try {
         const ret = ch(kind, message);
@@ -94,10 +94,10 @@ class AuthNotifier {
         // 否则 fetch/webhook 网络失败会 unhandled rejection → Node 15+ 默认 throw 终止进程
         // （审核实测复现，issue #69 阻断项；同步通道返回 undefined 不受影响）
         if (ret && typeof ret.catch === 'function') {
-          ret.catch((err) => log(`⚠️ [notify] 异步通道发送失败: ${err?.message || err}`));
+          ret.catch((err) => log(`[警告] [notify] 异步通道发送失败: ${err?.message || err}`));
         }
       } catch (err) {
-        log(`⚠️ [notify] 通道发送失败: ${err.message}`);
+        log(`[警告] [notify] 通道发送失败: ${err.message}`);
       }
     }
   }

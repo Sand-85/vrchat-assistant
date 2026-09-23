@@ -30,8 +30,9 @@
 **前置条件**：Node.js ≥ 22、一个 VRChat 账号（开启邮箱 OTP 或 TOTP 两步验证）。仅用邮箱 OTP 登录时才需要支持 IMAP 的邮箱（接收验证码）。
 
 1. 克隆仓库，复制 `credentials.example.json` 为 `credentials.json`，填入 VRChat 账号；认证二选一——邮箱 OTP 登录填邮箱 IMAP 授权码，或配置 `totp_secret` 走 TOTP 自动登录
-2. 启动服务：`node start-monitor.js`
-3. 验证：`curl http://127.0.0.1:8799/health` 返回 JSON 中 `auth.authenticated` 为 `true`、`ws.status` 为 `connected`
+2. 安装依赖：仓库根执行 `npm install`；再执行 `npm run install-plugins`（或逐插件 `npm ci --prefix plugins/official/<name>`）——带第三方依赖的插件需此步，否则该插件不会加载。**该命令也会为带前端源码的插件构建产物**（当前为 web-dashboard 的新版 dashboard UI）；单独重建可执行 `npm run build:dashboard`（**重建后需重启服务生效**——产物在插件加载时读入）。前端产物不入库（issue #186），缺失时服务回退旧版 UI 并在日志/`/health` 告警；**离线/内网环境**：npm 依赖不可达时前端构建会跳过（只告警不阻断）——可在有网机器执行 `npm run build:dashboard`，再把生成的 `plugins/official/web-dashboard/ui/dist/` 复制到目标机同一路径
+3. 启动服务：`node start-monitor.js`
+4. 验证：`curl http://127.0.0.1:8799/health` 返回 JSON 中 `auth.authenticated` 为 `true`、`ws.status` 为 `connected`
 
 > 完整的凭据、环境变量、开机自启、插件安装等配置步骤，交给 AI Agent 按 [AGENTS.md](./AGENTS.md) 自动完成即可——你只需要提供账号和验收。
 
@@ -45,13 +46,13 @@
 | [skills/](./skills/) | 开箱即用的 Agent Skill 合集（含 MCP 工具清单、查询工作流、开发规范等，安装说明见 AGENTS.md） | 查询 / 调用工具 / 开发功能前 |
 | [DEVELOPMENT.md](./DEVELOPMENT.md) | 开发规范：跨平台约束、PR 要求、数据隐私、代码规范 | 修改代码 / 提交 PR |
 | [ARCHITECTURE.md](./ARCHITECTURE.md) | 系统架构：数据流、模块职责、插件化架构层次 | 理解代码结构 |
-| [docs/PLUGIN-API.md](./docs/PLUGIN-API.md) | 插件契约（v1.1）：插件与核心的唯一契约、6 面 API、安全与命名约束 | 编写插件前必读 |
-| [docs/PLUGIN-DEV.md](./docs/PLUGIN-DEV.md) | 插件开发指南：目录结构、register(api)、6 面 API 用法、核心服务消费 | 编写插件 / 扩展功能 |
+| [docs/PLUGIN-API.md](./docs/PLUGIN-API.md) | 插件契约（v1.3）：插件与核心的唯一契约、8 面 API、安全与命名约束 | 编写插件前必读 |
+| [docs/PLUGIN-DEV.md](./docs/PLUGIN-DEV.md) | 插件开发指南：目录结构、register(api)、8 面 API 用法、核心服务消费 | 编写插件 / 扩展功能 |
 | [docs/history/](./docs/history/INDEX.md) | 项目演进记录：里程碑时间线、每月发布/PR 与演进意义 | 新 Agent 上手先读 |
 | [service-windows/](./service-windows/README.md) | Windows 开机自启 + 崩溃自愈 + 每日修复报告（一键脚本） | Windows 常驻运行 |
 | [service-linux/](./service-linux/README.md) | Linux systemd 用户服务：开机自启 + 崩溃自愈 + journal 日志（一键脚本） | Linux 常驻运行 |
 
-**MCP 工具**：服务通过 MCP 暴露工具，覆盖好友查询、社交互动、媒体管理、群组操作、世界推荐、素材检索、社区活动聚合等能力域。这些工具由**核心域工具 + 官方插件域工具**分层组成（插件域：auth-guard / booth / events / favorites / groups / media / planet / recommend / world-kb / x-creators，其中 events 提供 `fetch_community_events` 聚合社区活动），经统一注册表按序输出给客户端。**权威工具清单（全部工具）统一登记在 [skills/vrc-monitor-agent/SKILL.md](./skills/vrc-monitor-agent/SKILL.md)「MCP 工具」章节**，Agent 照此调用；插件结构与开发方式见 [docs/PLUGIN-DEV.md](./docs/PLUGIN-DEV.md)，插件契约见 [docs/PLUGIN-API.md](./docs/PLUGIN-API.md)。其余 skill 为各能力域的工作流补充（不重复登记工具）：`vrchat-social-queries`（社交域：在线五要素/同屏/规律/昵称）、`vrchat-world-queries`（世界域：待逛/推荐/情报挖掘）、`vrchat-group-queries`（群组域：查询/公告分诊）、`booth-query-display`（BOOTH 检索/展示格式）、`vrchat-assistant-development`（开发规范）、`review-workflow`（审核工作流：PR/issue 审核、端到端实测、多轮复核、协作审核），以及一批工程/审查工作流 skill：`acceptance-orchestrator`、`address-github-comments`、`closed-loop-delivery`、`code-review`、`create-issue-gate`、`effort-estimate`、`github-code-review`、`github-issue-to-pr`、`github-pr-workflow`、`plugin-first-web-dashboard`、`requesting-code-review`、`sdlc-review`、`session-review`。完整清单见 `skills/` 目录。
+**MCP 工具**：服务通过 MCP 暴露工具，覆盖好友查询、社交互动、媒体管理、群组操作、世界推荐、素材检索、社区活动聚合等能力域。这些工具由**核心域工具 + 官方插件域工具**分层组成（插件域：auth-guard / booth / events / favorites / groups / media / planet / presence-status / recommend / redeem / world-kb / x-creators，其中 events 提供 `fetch_community_events` 聚合社区活动，presence-status 提供 `get_presence_status` / `set_presence_status` 按自己是否在游戏内切换自定义状态文字（不在游戏→挂机文案；回到游戏→恢复上次下线时的状态），redeem 提供兑换码提交与礼包领取（`redeem_code` / `get_redeemable_bundles` / `claim_bundle` / `get_inventory_items` / `get_redeem_history`）），经统一注册表按序输出给客户端。**权威工具清单（全部工具）统一登记在 [skills/vrc-monitor-agent/SKILL.md](./skills/vrc-monitor-agent/SKILL.md)「MCP 工具」章节**，Agent 照此调用；插件结构与开发方式见 [docs/PLUGIN-DEV.md](./docs/PLUGIN-DEV.md)，插件契约见 [docs/PLUGIN-API.md](./docs/PLUGIN-API.md)。其余 skill 为各能力域的工作流补充（不重复登记工具）：`vrchat-social-queries`（社交域：在线五要素/同屏/规律/昵称）、`vrchat-world-queries`（世界域：待逛/推荐/情报挖掘）、`vrchat-group-queries`（群组域：查询/公告分诊）、`booth-query-display`（BOOTH 检索/展示格式）、`booth-purchase-automation`（BOOTH 真实购买闭环与确认纪律）、`vrchat-assistant-development`（开发规范）、`review-workflow`（审核工作流：PR/issue 审核、端到端实测、多轮复核、协作审核），以及一批工程/审查工作流 skill：`acceptance-orchestrator`、`address-github-comments`、`closed-loop-delivery`、`code-review`、`create-issue-gate`、`effort-estimate`、`github-code-review`、`github-issue-to-pr`、`github-pr-workflow`、`plugin-first-web-dashboard`、`requesting-code-review`、`sdlc-review`、`session-review`。完整清单见 `skills/` 目录。
 
 ## 🧰 辅助工具（本机可选）
 
@@ -81,6 +82,19 @@ jq -r 'select(.level=="error") | "\(.ts) [\(.name)] \(.msg)"' "$VRC_MONITOR_LOGG
 ```
 
 单文件达到 `MAX_SIZE` 时自动轮转压缩为 `.gz`，命名形如 `monitor-YYYYMMDD-HHMMSS-<pid>.log.gz`，最多保留 `MAX_FILES` 份。
+
+## 🐦 X 博主世界推荐（可选）
+
+想让自己关注的 X 博主推荐的 VRChat 世界自动进库（`x_scan_creators` / `x_world_digest` 系列工具），需要一个 X 登录态的 cookie：
+
+1. 浏览器登录 x.com，用 Cookie-Editor 之类的扩展**导出全部 cookie**（至少包含 `auth_token` 与 `ct0`）；
+2. 存成单行文本写入 `<仓库>/data/x_cookie.txt`（该目录已被 .gitignore 排除，不会提交）；
+3. 重启服务即可，`x_scan_creators` 会自动优先走 X 站内接口。
+
+> 为什么需要 cookie：Nitter 公共实例 2026 年起被反爬墙大面积拦截、X 的匿名搜索接口返回 404，只有登录态能稳定取到博主的时间线；未配置时该通道降级失败但**不影响其他功能**。
+> cookie 数月会过期，届时按同样步骤重新导出即可（报错会明确提示「cookie 失效」）。也可以在仓库根 `.env` 里用 `VRC_MONITOR_X_COOKIE_FILE` 指定别的路径。
+>
+> **可调项**（一般无需改）：博主间请求间隔 `VRC_MONITOR_X_CREATOR_DELAY_MS`（默认 1200ms）、命中限流后的退避窗口 `VRC_MONITOR_X_RATE_LIMIT_BACKOFF_MS`（默认 5 分钟）、两个 GraphQL queryId（`VRC_MONITOR_X_USERTWEETS_QUERY_ID` / `VRC_MONITOR_X_USERBYSCREENNAME_QUERY_ID`，X 轮换前端时按报错提示更新）。完整清单见 `AGENTS.md`「设置环境变量」章节。
 
 ## 🛠 故障排查
 
@@ -113,6 +127,14 @@ QQ 群：**851865556** — 欢迎加入，交流使用问题、功能建议与�
 ![收款码](assets/sponsor-qrcodes.png)
 
 **请给我报销 token** 🙏
+
+## 🙏 贡献者
+
+感谢每一位贡献者，让这个项目变得更好：
+
+![贡献者](https://contrib.rocks/image?repo=ggg123124/vrchat-assistant)
+
+> 头像网格由 [contrib.rocks](https://contrib.rocks) 从 GitHub 贡献者 API 自动生成。
 
 ## 📄 License
 

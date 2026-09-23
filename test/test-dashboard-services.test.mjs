@@ -70,6 +70,34 @@ test('dashboard.trackedNonFriends 返回 tracked 列表形状', () => {
   assert.ok(r.tracked.some((x) => x.userId === UID && x.displayName === '测试用户'));
 });
 
+test('tracked 列表权威源兜底：已是好友必不显示，解除好友自动回列（#164 补漏）', () => {
+  const UID2 = 'usr_test-0000-0000-0000-000000000002';
+  ctx.storage.run(
+    `INSERT OR REPLACE INTO tracked_non_friends (user_id, display_name, avatar_image_url, added_at, last_refresh_at)
+     VALUES ($u, $d, '', datetime('now'), datetime('now'))`,
+    { $u: UID2, $d: '曾追踪现好友' });
+  // 模拟 friend-add 事件丢失（联动未写 removed_at）：直接进 friends 权威表
+  ctx.storage.run(`INSERT OR REPLACE INTO friends (user_id, display_name) VALUES ($u, $d)`, { $u: UID2, $d: '曾追踪现好友' });
+  let r = services.get('dashboard.trackedNonFriends')({ limit: 50 });
+  assert.ok(!r.tracked.some((x) => x.userId === UID2), '已是好友的条目不得出现在追踪列表');
+  // 解除好友（friend-delete 联动删 friends 行）→ 自动回列，无需 removed_at
+  ctx.storage.run(`DELETE FROM friends WHERE user_id = $u`, { $u: UID2 });
+  r = services.get('dashboard.trackedNonFriends')({ limit: 50 });
+  assert.ok(r.tracked.some((x) => x.userId === UID2), '解除好友后应自动回到追踪列表');
+});
+
+test('trackedMemo 设置/清除备注，列表携带 memo 字段', () => {
+  const set = services.get('dashboard.trackedMemo')({ userId: UID, memo: '  群里认识的， Worlds 测试爱好者  ' });
+  assert.equal(set.ok, true);
+  assert.equal(set.memo, '群里认识的， Worlds 测试爱好者', '应 trim 且截断后保存');
+  let x = services.get('dashboard.trackedNonFriends')({ limit: 10 }).tracked.find((i) => i.userId === UID);
+  assert.equal(x.memo, '群里认识的， Worlds 测试爱好者', '列表应携带 memo');
+  assert.throws(() => services.get('dashboard.trackedMemo')({ userId: 'bad-id', memo: 'x' }), /usr_/, '非 usr_ 前缀应拒绝');
+  services.get('dashboard.trackedMemo')({ userId: UID, memo: '' });
+  x = services.get('dashboard.trackedNonFriends')({ limit: 10 }).tracked.find((i) => i.userId === UID);
+  assert.equal(x.memo, '', '空串应清除备注');
+});
+
 test('trackedNonFriends.lastChangeAt 与 trackedChanges 最新变化一致（真实变更时间，非检测时间）', () => {
   const list = services.get('dashboard.trackedNonFriends')({ limit: 10 }).tracked;
   const x = list.find((i) => i.userId === UID);
@@ -111,6 +139,24 @@ test('dashboard.trackedChanges 返回 avatar 变化形状（前后缩略图字�
   assert.ok(av.avatarImageUrl.startsWith('/api/dashboard/image-proxy?url='), '头像应走本地图片代理');
   assert.ok(decodeURIComponent(av.avatarImageUrl).includes('/image/'), '头像应缩略图化');
   assert.ok(av.previousAvatarImageUrl);
+});
+
+test('dashboard.trackedChanges 返回 location 变化（上下线/换世界透传，PR #149）', () => {
+  ctx.storage.insertEvent({
+    type: 'friend-update', userId: UID, displayName: '测试用户',
+    contentJson: { userId: UID, displayName: '测试用户', type: 'location',
+      location: 'wrld_44a2b6c8-83c5-4a5e-a5cf-99a5dbf8b8c3:12345', previousLocation: 'offline',
+      worldId: 'wrld_44a2b6c8-83c5-4a5e-a5cf-99a5dbf8b8c3', worldName: '测试世界' },
+    worldId: 'wrld_44a2b6c8-83c5-4a5e-a5cf-99a5dbf8b8c3', worldName: '测试世界',
+    createdAt: new Date().toISOString(), source: 'poll',
+  });
+  const r = services.get('dashboard.trackedChanges')({ userId: UID, limit: 20 });
+  const loc = r.changes.find((c) => c.type === 'location');
+  assert.ok(loc, 'location 变化在时间线中');
+  assert.equal(loc.previousLocation, 'offline', '旧位置（离线）透传');
+  assert.ok(loc.location.startsWith('wrld_'), '新位置透传');
+  assert.equal(loc.worldId, 'wrld_44a2b6c8-83c5-4a5e-a5cf-99a5dbf8b8c3', 'worldId 透传');
+  assert.equal(loc.worldName, '测试世界', 'worldName 透传（前端 locLabel 附加显示用）');
 });
 
 test('dashboard.trackedChanges 对非法 userId 返回空', () => {
@@ -232,13 +278,14 @@ test('dashboard.trackedAdd 幂等 + 拒绝自己 + trackedRemove 标记', () => 
 });
 
 test('dashboard.groupAnnouncementsAll 汇总跨群组公告', () => {
-  const ev = (gid, gname, title, msg, dt) => ctx.storage.insertEvent({
+  const ev = (gid, gname, title, msg, dt, imageUrl) => ctx.storage.insertEvent({
     type: 'notification-v2', userId: 'usr_ann', displayName: '公告',
     contentJson: { id: 'not_' + gid, type: 'group.announcement', title: gname + ': ' + title, message: msg,
+      ...(imageUrl ? { imageUrl } : {}),
       data: { groupId: gid, groupName: gname, announcementTitle: title } },
     worldId: '', worldName: '', createdAt: new Date(Date.now() - dt).toISOString(), source: 'ws',
   });
-  ev('grp_ann1', '群组A', '公告一', '内容一', 300000);
+  ev('grp_ann1', '群组A', '公告一', '内容一', 300000, 'https://api.vrchat.cloud/api/1/file/file_ann1cover/1/file');
   ev('grp_ann2', '群组B', '公告二', '内容二', 600000);
   const r = services.get('dashboard.groupAnnouncementsAll')({ limit: 50 });
   assert.ok(r.total >= 2, '至少汇总 2 条公告');
@@ -247,6 +294,11 @@ test('dashboard.groupAnnouncementsAll 汇总跨群组公告', () => {
   assert.equal(a1.title, '公告一');
   assert.equal(a1.groupName, '群组A');
   assert.equal(a1.text, '内容一');
+  // PR #149：公告封面图解析（content 顶层 imageUrl 经本地代理）；无图公告为空串
+  assert.ok(a1.imageUrl && a1.imageUrl.startsWith('/api/dashboard/image-proxy?url='), '封面图经本地代理');
+  assert.ok(decodeURIComponent(a1.imageUrl).includes('file_ann1cover'), '代理 URL 还原后含原始 file id');
+  const a2 = r.announcements.find((a) => a.groupId === 'grp_ann2');
+  assert.equal(a2.imageUrl, '', '无图公告 imageUrl 为空串（不产生空代理 URL）');
   // 降序（最新在前）
   const ts = r.announcements.map((a) => a.createdAt);
   const sorted = [...ts].sort().reverse();
@@ -427,6 +479,67 @@ test('dashboard.notificationEvents 群组通知提取 groupName（ownerName/owne
   assert.equal(ann.groupName, 'CAT', 'groupName 应被提取，实际: ' + ann.groupName);
   assert.ok(boop, 'boop 通知应存在');
   assert.equal(boop.groupName, '', '非群组通知 groupName 应为空（title 兜底限定 group.*），实际: ' + JSON.stringify(boop.groupName));
+});
+
+// ── recentWorlds 世界补名负缓存 TTL（审者建议后续优化：占位无 TTL 导致瞬时失败永不自愈）──
+// 语义：无 world_cache 记录 → 触发补名；空名占位在 24h TTL 内 → 抑制（零新增 API 尝试）；
+// 占位超 TTL → 放行一次重试；失败写占位刷新 updated_at（续期冷却）；成功落真名自愈。
+const ttlWorld = (id) => `wrld_ttl-${id}-0000-0000-0000-000000000000`;
+const insertNamelessLocation = (worldId) => ctx.storage.insertEvent({
+  type: 'user-location', userId: 'usr_ttl', displayName: '我',
+  contentJson: { location: worldId + ':1' }, worldId, worldName: '',
+  createdAt: new Date().toISOString(), source: 'ws',
+});
+const upsertPlaceholder = (worldId, ageExpr) => ctx.storage.run(
+  `INSERT OR REPLACE INTO world_cache (world_id, name, updated_at) VALUES ('${worldId}', '', ${ageExpr})`
+);
+const placeholderUpdatedAt = (worldId) => {
+  const r = ctx.storage.query(`SELECT updated_at AS u FROM world_cache WHERE world_id=$w`, { $w: worldId });
+  return r[0] ? r[0].u : null;
+};
+const flushMicrotasks = () => new Promise((r) => setTimeout(r, 0));
+
+test('recentWorlds 补名：无占位触发 / TTL 内抑制 / 超 TTL 重试 / 失败续期 / 成功自愈', async () => {
+  // ① 无记录 → 触发补名 1 次，成功落真名后不再触发
+  const wA = ttlWorld('a');
+  insertNamelessLocation(wA);
+  let callsA = 0;
+  loader.services.set('dashboard.world', (args) => {
+    callsA++;
+    ctx.storage.upsertWorld({ worldId: args.worldId, name: '真名世界A' });
+    return { name: '真名世界A' };
+  });
+  services.get('dashboard.recentWorlds')({ limit: 60 });
+  assert.equal(callsA, 1, '无占位世界应触发补名 1 次');
+  await flushMicrotasks();
+  assert.equal(ctx.storage.getWorldName(wA)?.name, '真名世界A', '补名成功应落真名');
+  services.get('dashboard.recentWorlds')({ limit: 60 });
+  assert.equal(callsA, 1, '落真名后不应再次触发');
+
+  // ② 空名占位在 TTL 内（5 分钟前）→ 抑制，零新增 API 调用
+  const wB = ttlWorld('b');
+  insertNamelessLocation(wB);
+  upsertPlaceholder(wB, `datetime('now','-5 minutes')`);
+  let callsB = 0;
+  loader.services.set('dashboard.world', (args) => { callsB++; return null; });
+  services.get('dashboard.recentWorlds')({ limit: 60 });
+  assert.equal(callsB, 0, 'TTL 内空名占位应抑制补名（负缓存生效）');
+
+  // ③ 占位超 TTL（25 小时前）→ 放行重试 1 次；失败写占位刷新 updated_at（续期冷却）
+  const wC = ttlWorld('c');
+  insertNamelessLocation(wC);
+  upsertPlaceholder(wC, `datetime('now','-25 hours')`);
+  let callsC = 0;
+  loader.services.set('dashboard.world', (args) => { callsC++; return null; }); // 补名失败（API 不可见）
+  services.get('dashboard.recentWorlds')({ limit: 60 });
+  assert.equal(callsC, 1, '超 TTL 占位应放行一次重试');
+  await flushMicrotasks();
+  const refreshed = placeholderUpdatedAt(wC);
+  const oneMinuteAgoUtc = new Date(Date.now() - 60000).toISOString().replace('T', ' ').slice(0, 19);
+  assert.ok(refreshed && refreshed >= oneMinuteAgoUtc,
+    `失败后占位 updated_at 应刷新（续期），实际 ${refreshed}`);
+  services.get('dashboard.recentWorlds')({ limit: 60 });
+  assert.equal(callsC, 1, '刷新后的占位在 TTL 内不应再次触发');
 });
 
 // ── 清理 ──
