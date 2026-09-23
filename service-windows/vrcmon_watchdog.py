@@ -1,16 +1,28 @@
 """vrc-monitor watchdog — 崩溃自动修复（建议由计划任务每分钟运行一次）。
 
-行为：
+行为（判据见下方常量注释，三者是**独立的**三道闸）：
   - 服务健康（http://127.0.0.1:8799/health 返回 200）→ 清零连续失败计数，静默退出。
-  - 服务不健康但**端口尚未监听或刚拉起过（< GRACE_SECONDS=300s）**→ 认为仍在启动中，
-    静默退出不做任何动作（大库 storage.init 实测可达 70s+，此前 4s 超时会误判为宕机，
-    导致「杀掉正在启动的进程 → 重新拉起 → 又超时 → 再杀」的每分钟重启风暴，
-    每次重启还会触发一次全量 DB 备份）。
-  - 服务不健康但**只是偶发一次**（连续失败未达 FAIL_THRESHOLD=2，窗口 FAIL_WINDOW=600s）
-    → 静默退出。事件循环被小时级任务阻塞时 /health 会短暂超时，单次超时不足以判定宕机。
-  - 连续若干次不健康 → 杀掉 :8799 残留监听进程（仅 Windows）→ 以独立进程重新启动 →
-    等待 25 秒验证 → 成功则在修复日志追加一行；失败写入 watchdog 日志。
+  - **启动宽限**：`starting_age() < GRACE_SECONDS` → 视为"正在启动"，本轮不介入。
+    `starting_age()` 取两个戳记中较新的一个：本 watchdog 拉起时写的
+    `service-logs/.vrcmon-watchdog-launch`，以及**服务自己**在 `storage.init` 前写的
+    `.vrcmon-service-start`（start-monitor.js；落在服务自己的日志目录——`VRC_MONITOR_LOGGER_DIR`
+    或默认 `<项目>/logs`，watchdog 在候选目录 `VRC_MONITOR_LOGGER_DIR` / `VRC_MONITOR_LOG_DIR`
+    （`service-logs/`）/ `<项目>/logs` 里找最新的一枚）。因此**任何拉起渠道**
+    （计划任务 watchdog / `vrcmon_service_launcher.py` / 手动 `node start-monitor.js` /
+    Hermes 插件 `vrc_start`）拉起的实例都能获得宽限；大库 storage.init 实测 50-70s+
+    也不会被误杀。判据只看"开始启动的时刻"，**不看端口状态**——init 期间端口可能已
+    Listen 但处理器阻塞在 DB 上（表现为请求超时），若把"端口未监听"当宽限条件仍会误杀。
+  - **连续失败**：同类不健康连续 `FAIL_THRESHOLD` 次（窗口 `FAIL_WINDOW`）才判定宕机。
+    事件循环被小时级任务阻塞时 `/health` 会单次超时，单次采样不足以判定死亡。
+  - 上述闸门都放行后：杀掉 :8799 残留监听进程（仅 Windows）→ 以独立进程重新启动 →
+    等待 25 秒验证 → 成功则在修复日志追加一行；失败写入 watchdog 日志并**清除启动戳记**
+    （不留 300s 静默窗口，下一轮即可重试）。
+
   - 全程无 stdout 输出（接入通知系统时：空输出 = 静默，可零成本轮询）。
+
+边界（如实声明）：两个启动戳记都不存在时（例如把仓库拷到新机器后直接 `node start-monitor.js`、
+本 watchdog 从未拉起过它）不使用启动宽限，此时仍由"连续失败"闸兜底——实测外部拉起 +
+init≈70s 为 0 次误杀，init > ~120s 时最坏被误杀一次。
 
 路径配置（环境变量，与 start-monitor.js 的 .env 约定一致）：
   VRC_MONITOR_DIR       项目根目录（默认：本脚本所在目录的上一级）
@@ -26,11 +38,17 @@
 import subprocess, sys, os, time, datetime, urllib.request
 
 HEALTH_URL = "http://127.0.0.1:8799/health"
-HEALTH_TIMEOUT = 8       # 健康检查超时（秒）：4s 在磁盘忙时太紧，容易误判
-GRACE_SECONDS = 300      # 启动宽限期：端口尚未监听 + 刚拉起过 → 视为启动中，不动它
-STAMP_NAME = ".vrcmon-watchdog-launch"   # 上次由本 watchdog 拉起服务的时刻戳
-FAIL_NAME = ".vrcmon-watchdog-unhealthy" # 连续不健康计数（内容 "count epoch"）
-FAIL_THRESHOLD = 2       # 连续探测失败达到该次数才判定宕机
+HEALTH_TIMEOUT = 8       # 单次健康检查超时（秒）。4s 在磁盘/事件循环忙时太紧，容易误判；
+                         # 注意它只是"降低误判概率"，不改变宽限语义：大库 init 窗口内
+                         # /health 本就不可用，那个窗口由 GRACE_SECONDS 负责（见下）。
+GRACE_SECONDS = 300      # 启动宽限：服务"开始启动"至今不足该秒数 → 视为启动中，不介入
+STAMP_NAME = ".vrcmon-watchdog-launch"        # 本 watchdog 上次拉起服务的时刻戳
+SERVICE_START_NAME = ".vrcmon-service-start"  # 服务自写启动戳记（start-monitor.js 于 storage.init 前落盘）
+FAIL_NAME = ".vrcmon-watchdog-unhealthy"      # 连续不健康计数（内容 "count epoch"）
+FAIL_THRESHOLD = 2       # 连续探测失败达到该次数才判定宕机。与计划任务默认每分钟调度
+                         # 合起来 = "两个相邻探测点都失败"（≈120s 才动手）：真宕机的重新
+                         # 拉起由 60s 推迟到 ≈120s（可接受），换来单次超时不再误杀。
+                         # 调大它等于再放宽一整个探测周期，调参时勿只改这里而不看语义。
 FAIL_WINDOW = 600        # 两次失败间隔超过该秒数则重新计数（秒）
 
 
@@ -117,6 +135,75 @@ def clear_fail():
         pass
 
 
+def seed_fail(count):
+    """把连续失败计数直接置为 count（拉起后 25s 验证失败时用：本轮尝试已知失败，
+    让下一轮即可重试，不必再等满一个探测周期）。"""
+    try:
+        os.makedirs(log_dir(), exist_ok=True)
+        with open(fail_path(), "w", encoding="utf-8") as f:
+            f.write(f"{count} {time.time()}")
+    except Exception:
+        pass
+
+
+def service_start_candidates():
+    """服务启动戳记的候选目录（按优先级、去重）。
+
+    两套日志目录约定刻意不同名（core/logger.js 注释写明）：
+      服务：`VRC_MONITOR_LOGGER_DIR`，默认 `<项目>/logs`
+      watchdog：`VRC_MONITOR_LOG_DIR`，默认 `<项目>/service-logs`
+    ⇒ 戳记落在服务自己的日志目录，watchdog 在三处候选里找。
+    """
+    cands = []
+    env = os.environ.get("VRC_MONITOR_LOGGER_DIR")
+    if env:
+        cands.append(os.path.abspath(env))
+    for d in (log_dir(), os.path.join(project_dir(), "logs")):
+        if d not in cands:
+            cands.append(d)
+    return cands
+
+
+def service_start_age():
+    """服务自写启动戳记的年龄（秒）；一处都没找到返回 None（取最新的一枚）。
+
+    由 start-monitor.js 在 storage.init 之前落盘，因此与"谁拉起的服务"无关：
+    计划任务 watchdog / vrcmon_service_launcher.py / 手动 / Hermes 插件 vrc_start
+    拉起的实例都受它保护。服务启动即崩溃时戳记会留在磁盘上，由 reset_stamps() 清除。
+    """
+    ages = []
+    for d in service_start_candidates():
+        try:
+            ages.append(time.time() - os.path.getmtime(os.path.join(d, SERVICE_START_NAME)))
+        except OSError:
+            pass
+    return min(ages) if ages else None
+
+
+def starting_age():
+    """"开始启动"至今的秒数：取两枚启动戳记中**较新**的一个；都没有则 None。
+
+    watchdog 戳记只覆盖"它自己发起过的拉起"，服务戳记覆盖其它拉起渠道 —— 两者取较新者，
+    宽限才能对任何拉起路径成立（审查 ⚠️2：外部拉起 + init > ~120s 曾被误杀一次）。
+    """
+    ages = [a for a in (stamp_age(), service_start_age()) if a is not None]
+    return min(ages) if ages else None
+
+
+def reset_stamps():
+    """清除启动戳记（watchdog 戳记 + 各候选目录里的服务戳记）。
+
+    拉起抛异常 / 拉起后 25s 验证失败时调用：否则"戳记很新但服务其实已死"会让下一轮
+    静默等满 GRACE_SECONDS（审查 ⚠️1）。
+    """
+    targets = [stamp_path()] + [os.path.join(d, SERVICE_START_NAME) for d in service_start_candidates()]
+    for p in targets:
+        try:
+            os.remove(p)
+        except OSError:
+            pass
+
+
 def port_pid(port=8799):
     """Windows: 返回监听指定端口的 PID（netstat 输出按本机代码页解码，兼容中文系统）。"""
     if sys.platform != "win32":
@@ -173,10 +260,12 @@ def main():
 
     now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    # 启动宽限期：只要是本 watchdog 刚拉起过的（< GRACE_SECONDS）就视为"正在启动"，本轮不介入。
-    # 注意：init 期间端口可能已 Listen 但处理器阻塞在 DB 上（表现为超时），
-    # 因此判据只看拉起时刻，不看端口状态，否则仍会误杀。
-    age = stamp_age()
+    # 启动宽限：服务"开始启动"至今不足 GRACE_SECONDS → 视为启动中，本轮不介入。
+    # starting_age() = max(本 watchdog 拉起戳记, 服务自写戳记) 取新 ⇒ 任何拉起渠道
+    # （launcher / 手动 / Hermes 插件）拉起的实例都在保护内。判据只看启动时刻、不看端口状态：
+    # init 期间端口可能已 Listen 但处理器阻塞在 DB 上（表现为请求超时），
+    # 若把"端口未监听"当宽限条件仍会误杀（第一版实现即因此失败）。
+    age = starting_age()
     if age is not None and age < GRACE_SECONDS:
         return 0
 
@@ -187,7 +276,6 @@ def main():
     if count < FAIL_THRESHOLD:
         return 0
 
-    clear_fail()
     pid = port_pid()
     if pid is not None:
         try:
@@ -198,16 +286,22 @@ def main():
 
     try:
         _launch_detached()
-        touch_stamp()   # 记录拉起时刻，供下一轮宽限期判定
     except Exception as e:
+        # 拉起失败：保留失败计数、清掉可能存在的旧戳记 ⇒ 下一轮立即重试，不白等一个探测点
         _append(os.path.join(log_dir(), "vrcmon-watchdog.log"), f"{now} launch error: {e}\n")
+        reset_stamps()
         return 0
+
+    touch_stamp()   # 记录拉起时刻，供下一轮宽限判定
+    clear_fail()    # 拉起成功后才清零（失败分支不应吞掉计数）
 
     time.sleep(25)
     if healthy():
         _append(os.path.join(log_dir(), "vrcmon-repairs.log"), f"{now} repair\n")
     else:
         _append(os.path.join(log_dir(), "vrcmon-watchdog.log"), f"{now} repair attempt failed (not healthy after 25s)\n")
+        reset_stamps()                    # 放弃宽限，否则静默等满 GRACE_SECONDS
+        seed_fail(FAIL_THRESHOLD - 1)     # 本轮尝试已知失败 ⇒ 下一轮即可重试（不白等一个周期）
     return 0
 
 
