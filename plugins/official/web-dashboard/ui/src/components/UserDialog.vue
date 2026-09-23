@@ -249,9 +249,11 @@ const rawJson = computed(() => {
     <Tabs v-else-if="profile" v-model:value="activeTab" :scrollable="true">
       <TabList>
         <Tab value="info">信息</Tab>
-        <Tab v-if="isFriend" value="mutual">共同好友<span v-if="profile.mutualFriendCount"> ({{ profile.mutualFriendCount }})</span></Tab>
+        <!-- 2026-09-22 实测：/users/{id}/mutuals/friends 对非好友可用 ✓（服务器直接算，无需对方开启共享 ✓）-->
+        <Tab value="mutual">共同好友<span v-if="profile.mutualFriendCount"> ({{ profile.mutualFriendCount }})</span></Tab>
         <Tab value="mutualgrp">共同群组<span v-if="profile.mutualGroupCount"> ({{ profile.mutualGroupCount }})</span></Tab>
-        <Tab v-if="isFriend" value="groups">群组<span v-if="profile.groups.length"> ({{ profile.groups.length }})</span></Tab>
+        <!-- 2026-09-22 实测：/users/{id}/groups 对非好友**可用**（拿到 18 个群组 ✓）⇒ 不再隐藏 ✓ -->
+        <Tab value="groups">群组<span v-if="profile.groups.length"> ({{ profile.groups.length }})</span></Tab>
         <Tab v-if="isFriend" value="worlds">创建的世界<span v-if="profile.worlds.length"> ({{ profile.worlds.length }})</span></Tab>
         <Tab value="favworlds">收藏的世界<span v-if="favTotal"> ({{ favTotal }})</span></Tab>
         <Tab v-if="isFriend" value="avatars">创建的模型<span v-if="profile.avatars.length"> ({{ profile.avatars.length }})</span></Tab>
@@ -261,7 +263,7 @@ const rawJson = computed(() => {
       <TabPanels>
         <!-- 信息 -->
         <TabPanel value="info">
-          <div v-if="!isFriend" class="ud-note"><i class="pi pi-info-circle"></i> 非好友 · 共同好友 / 群组 / 世界 / 模型信息不可见</div>
+          <div v-if="!isFriend" class="ud-note"><i class="pi pi-info-circle"></i> 非好友 · 创建的世界 / 模型列表不可见（群组、共同好友已可查看）</div>
           <div v-if="isOnline && instanceName" class="ud-loc">
             <i class="pi pi-map-marker"></i>
             <span class="link" @click="openWorld(user.worldId || '')">{{ instanceName }}</span>
@@ -294,7 +296,7 @@ const rawJson = computed(() => {
         </TabPanel>
 
         <!-- 共同好友 -->
-        <TabPanel value="mutual" v-if="isFriend">
+        <TabPanel value="mutual">
           <div v-if="!profile.mutualFriends.length" class="empty" style="padding:16px">暂无共同好友</div>
           <div v-else class="mini-list">
             <div v-for="f in profile.mutualFriends" :key="f.id" class="mini-row" role="button" tabindex="0" @click="store.userModal = { userId: f.id, displayName: f.displayName, avatarUrl: f.avatarUrl }" @keydown.enter="store.userModal = { userId: f.id, displayName: f.displayName, avatarUrl: f.avatarUrl }">
@@ -316,7 +318,7 @@ const rawJson = computed(() => {
         </TabPanel>
 
         <!-- 群组 -->
-        <TabPanel value="groups" v-if="isFriend">
+        <TabPanel value="groups">
           <div v-if="!profile.groups.length" class="empty" style="padding:16px">暂未加入群组</div>
           <div v-else class="mini-list">
             <div v-for="g in profile.groups" :key="g.id" class="mini-row" role="button" tabindex="0" @click="openGroup(g.id)" @keydown.enter="openGroup(g.id)">
