@@ -17,6 +17,14 @@ import shutil
 import sys
 import tempfile
 
+# Windows CI（cp1252 控制台）下 print 中文会抛 UnicodeEncodeError ⇒ 统一成 UTF-8；
+# 重设失败也不影响判据测试本身。
+for _s in (sys.stdout, sys.stderr):
+    try:
+        _s.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 WD_PATH = os.path.join(os.path.dirname(HERE), "vrcmon_watchdog.py")
 
