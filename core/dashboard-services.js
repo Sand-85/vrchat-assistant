@@ -833,7 +833,7 @@ export function registerDashboardServices(loader, ctx) {
     try {
       const rows = ctx.storage.query(
         `SELECT t.user_id AS userId, t.display_name AS displayName, t.avatar_image_url AS avatarUrl,
-                t.status, t.status_description AS statusDescription, t.location, t.memo,
+                t.status, t.status_description AS statusDescription, t.location, t.memo, t.trust_level AS trustLevel,   -- 2026-09-22：SELECT 是显式清单 ⇒ 新列必须显式加 ✗
                 t.added_at AS addedAt, t.last_refresh_at AS lastRefreshAt,
                 (SELECT e.created_at FROM events e
                   WHERE e.user_id = t.user_id AND e.type = 'friend-update' AND e.source = 'poll'
@@ -847,7 +847,7 @@ export function registerDashboardServices(loader, ctx) {
         { $limit: Math.min(Math.max(Number(limit) || 200, 1), 500) });
       const selfId = getSelfUserId(ctx.storage);
       // 2026-09-22 用户报障「非好友追踪页全是大写首字母」：追踪表的 avatarUrl 常常是空的 ⇒ 回退到该用户最近一次带图的事件 ✓
-      return { tracked: rows.filter((r) => r.userId !== selfId).map((r) => ({ ...r, avatarUrl: avatarThumb(r.avatarUrl) || lastKnownAvatarUrl(r.userId) || '' })) };
+      return { tracked: rows.filter((r) => r.userId !== selfId).map((r) => ({ ...r, trustLevel: r.trustLevel || '', avatarUrl: avatarThumb(r.avatarUrl) || lastKnownAvatarUrl(r.userId) || '' })) };
     } catch {
       return { tracked: [] };
     }

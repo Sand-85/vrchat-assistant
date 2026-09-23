@@ -326,6 +326,11 @@ async function _refreshTrackedNonFriends() {
       const userObj = r.data;
       const av = userObj.currentAvatarImageUrl || userObj.currentAvatarThumbnailImageUrl || userObj.userIcon || '';
       const dn = userObj.displayName || u.display_name || '';
+      // 2026-09-22：非好友也能拿信任等级（/users/{id} 的 tags 有值 ⇒ 与好友页同一套映射）
+      // 2026-09-22 评审 🔴：原先顶层 import 了 core/friend-refresh.js —— 该模块只由**仍 open 的 #222** 引入 ✗
+      // ⇒ 若本 PR 先合并，node start-monitor.js 会在加载阶段 ERR_MODULE_NOT_FOUND 直接崩 ✗
+      // ⇒ 改用**本文件既有**的 inferTrustFromTags()（main 上就有 ✓，映射与 VRCX computeTrustLevel 对齐 ✓）
+      const tl = (() => { try { return inferTrustFromTags(Array.isArray(userObj.tags) ? userObj.tags : []) || ''; } catch { return ''; } })();
       // 2026-09-22：非好友的**当前模型名**也能拿 ✓（实测：iconUrl 的 fileId → GET /file/{id} → name = 「Avatar - 模型名 - Image - …」✓）
       // 与事件补名共用同一张缓存 planet_cache 的 avatar_name:<fid> ✓；解析不到就留空、不覆盖旧值 ✓
       // ⚠️ 失败时也写一条 miss（6 小时 TTL）—— 否则每次刷新都会重试同一批不可解析的 fileId ✗
@@ -378,8 +383,8 @@ async function _refreshTrackedNonFriends() {
       const loc = userObj.location || '';
       if (av || dn || st || loc) {
         storage.run(
-          `UPDATE tracked_non_friends SET avatar_image_url=$a, display_name=$d, status=$s, status_description=$sd, location=$l, last_refresh_at=datetime('now') WHERE user_id=$u`,
-          { $a: av, $d: dn, $s: st, $sd: stDesc, $l: loc, $u: u.user_id }
+          `UPDATE tracked_non_friends SET avatar_image_url=$a, display_name=$d, status=$s, status_description=$sd, location=$l, trust_level=$tl, last_refresh_at=datetime('now') WHERE user_id=$u`,
+          { $a: av, $d: dn, $s: st, $sd: stDesc, $l: loc, $tl: tl || (u.trust_level || ''), $u: u.user_id }
         );
       }
       // location/上下线变化检测（#146）：轮询 1h 低频，offline/offline:offline/traveling 离线态微动与转场不记录
